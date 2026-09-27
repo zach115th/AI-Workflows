@@ -1,0 +1,1301 @@
+{
+  "name": "CyberIntel Daily Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "2627fd46-4624-5f63-a581-f4a53a938302",
+      "name": "Daily 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "429810b7-c18b-5830-84f2-17937f186c62",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Central configuration. Every downstream node reads $('Config').first().json.\nconst tz = 'America/Los_Angeles';\nconst now = new Date();\nconst run_date = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);\nlet env = {};\ntry { env = { lm: $env.LMSTUDIO_URL, qd: $env.QDRANT_URL, dw: $env.DISCORD_WEBHOOK_URL, or: $env.OPENROUTER_API_KEY, gq: $env.GROQ_API_KEY, mu: $env.MISP_URL, mk: $env.MISP_API_KEY }; } catch (e) { /* env access blocked -> defaults below */ }\nreturn [{ json: {\n  run_date,\n  run_started: now.toISOString(),\n  timezone: tz,\n  lookback_hours: 36,\n  lmstudio_url: String(env.lm || 'http://localhost:11434/v1').replace(/\\/$/, ''),\n  qdrant_url: String(env.qd || 'http://qdrant:6333').replace(/\\/$/, ''),\n  // MISP as the story ledger (2026-09-12): one event per story, later days append attributes to the same event.\n  // Key via $env (MISP_API_KEY, the OpenRouter precedent: sequencing create/append/read-back needs code). Empty = skipped.\n  misp_url: String(env.mu || 'https://misp.example.com').replace(/\\/$/, ''),\n  misp_enabled: !!(env.mk && String(env.mk).trim()),\n  misp_distribution: 0,              // \"Your organisation only\"\n  misp_tags: ['tlp:clear', 'cyberintel:source=\"daily-digest\"'],\n  misp_to_ids_verdicts: ['malicious', 'suspicious'],\n  chat_model: 'google/gemma-4-e2b',\n  // Synthesis providers. PRIMARY: OpenRouter free models — the whole \":free\" catalog is fetched live at run start\n  // and ranked (preferred list first, then structured-output support, context, size). Per-model failures bench that\n  // model for the run; an account-level limit (50 req/day without credits) benches OpenRouter for the run.\n  // FAILOVER: LM Studio (bare 500s while (re)loading the model -> retry with backoff).\n  openrouter_enabled: true,\n  openrouter_has_key: !!(env.or && String(env.or).trim()),\n  openrouter_min_context: 32000,\n  openrouter_delay_ms: 600,          // stay well under the 20 req/min free-tier ceiling\n  openrouter_cooldown_ms: 90000,     // a failing model sits out 90 s, doubling per strike (404/400 = out for the run)\n  openrouter_timeout_ms: 90000,      // was 180 s; hanging free models were the main cost per story (2026-09-14)\n  openrouter_preferred: ['nvidia/nemotron-3-super-120b-a12b:free', 'google/gemma-4-31b-it:free', 'dots-studio/dots-3-note-preview:free', 'minimax/minimax-m2.7:free', 'google/gemma-4-26b-a4b-it:free'],  // glm-5.2:free went paid-only 2026-09-06\n  // Groq free tier (per-model tokens-per-day limits): second tier, absorbs what OpenRouter's 50/day cannot.\n  groq_enabled: true,\n  groq_has_key: !!(env.gq && String(env.gq).trim()),\n  groq_min_context: 32000,\n  groq_delay_ms: 2100,               // 30 req/min per model on the free tier\n  groq_cooldown_ms: 90000,\n  groq_timeout_ms: 120000,\n  groq_preferred: ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'moonshotai/kimi-k2-instruct', 'qwen/qwen3-32b', 'openai/gpt-oss-20b', 'meta-llama/llama-4-maverick-17b-128e-instruct', 'meta-llama/llama-4-scout-17b-16e-instruct', 'llama-3.1-8b-instant'],\n  provider_order: ['openrouter', 'groq', 'lmstudio'],   // per story, first provider that answers wins\n  // Run-level time budget for synthesis (2026-09-14: 37 stories × ~3.5 min of hosted retries outlived the 90-min task\n  // timeout and the day's digest never posted). Each story gets an equal share of what is left; a story that overruns\n  // its share moves to the next provider, and once the budget is gone the rest go straight to LM Studio (one try).\n  synth_budget_ms: 45 * 60 * 1000,\n  synth_story_min_ms: 60 * 1000,\n  lmstudio_tries: 3,\n  lmstudio_backoff_ms: 8000,\n  // Embeddings (LM Studio only — no free cloud embedding model exists). Switched 2026-09-11 from nomic-embed-text-v1.5\n  // (768-d, 'search_document: ' prefix) to Qwen3-Embedding-4B (2560-d, documents take no prefix); the collection name\n  // carries the model generation because Qdrant vector sizes are fixed per collection.\n  embed_model: 'text-embedding-qwen3-embedding-4b',\n  embed_dim: 2560,\n  embed_prefix: '',\n  collection: 'cyberintel_articles_v2',\n  similarity_threshold: 0.78,        // join two articles when they ALSO share a CVE or >=2 distinctive title tokens\n  similarity_threshold_hard: 0.92,   // join on vectors alone (near-identical text)\n  prior_similarity_threshold: 0.85,  // link a story to something digested on an earlier day\n  // Cross-encoder judge (Qwen3-Reranker-4B in LM Studio, added 2026-09-11): decides pairs the thresholds cannot —\n  // cosine in [rerank_band_low, hard) without lexical evidence — and confirms prior-story candidates. Off = old behaviour.\n  reranker_enabled: true,\n  reranker_model: 'qwen3-reranker-4b',\n  rerank_band_low: 0.70,\n  rerank_max_pairs: 40,\n  rerank_prior_links: true,\n  max_article_chars: 9000,\n  max_cluster_chars: 36000,          // ~10k tokens per story; keep well inside the model's loaded context\n  max_output_tokens: 6000,           // gemma-4 spends hidden reasoning tokens; 2000 truncated a small test\n  max_cves_to_enrich: 60,            // NVD is 5 req / 30 s without a key\n  max_iocs_to_enrich: 200,           // VirusTotal free tier: 4/min, 500/day -> 200 lookups ~ 52 min worst case (severity-ordered)\n  output_dir: '/data/intel/output',\n  attack_map_path: '/data/intel/data/attack-techniques.json',\n  discord_webhook: String(env.dw || '').trim(),   // empty -> \"Post to Discord?\" routes everything to its false branch\n  feeds: [\n    {\n        \"source\": \"BleepingComputer\",\n        \"url\": \"https://www.bleepingcomputer.com/feed/\"\n    },\n    {\n        \"source\": \"The Hacker News\",\n        \"url\": \"https://feeds.feedburner.com/TheHackersNews\"\n    },\n    {\n        \"source\": \"SecurityWeek\",\n        \"url\": \"https://www.securityweek.com/feed/\"\n    },\n    {\n        \"source\": \"Dark Reading\",\n        \"url\": \"https://www.darkreading.com/rss.xml\"\n    },\n    {\n        \"source\": \"The Record\",\n        \"url\": \"https://therecord.media/feed\"\n    },\n    {\n        \"source\": \"Krebs on Security\",\n        \"url\": \"https://krebsonsecurity.com/feed/\"\n    },\n    {\n        \"source\": \"SANS ISC\",\n        \"url\": \"https://isc.sans.edu/rssfeed_full.xml\"\n    },\n    {\n        \"source\": \"CISA\",\n        \"url\": \"https://www.cisa.gov/cybersecurity-advisories/all.xml\"\n    },\n    {\n        \"source\": \"Unit 42\",\n        \"url\": \"https://unit42.paloaltonetworks.com/feed/\"\n    },\n    {\n        \"source\": \"Cisco Talos\",\n        \"url\": \"https://blog.talosintelligence.com/rss/\"\n    },\n    {\n        \"source\": \"Schneier on Security\",\n        \"url\": \"https://www.schneier.com/feed/atom/\"\n    },\n    {\n        \"source\": \"Microsoft Security\",\n        \"url\": \"https://www.microsoft.com/en-us/security/blog/feed/\"\n    },\n    {\n        \"source\": \"Check Point Research\",\n        \"url\": \"https://research.checkpoint.com/feed/\"\n    },\n    {\n        \"source\": \"ESET WeLiveSecurity\",\n        \"url\": \"https://www.welivesecurity.com/en/rss/feed/\"\n    },\n    {\n        \"source\": \"Malwarebytes Labs\",\n        \"url\": \"https://www.malwarebytes.com/blog/feed/index.xml\"\n    },\n    {\n        \"source\": \"Huntress\",\n        \"url\": \"https://www.huntress.com/blog/rss.xml\"\n    },\n    {\n        \"source\": \"Elastic Security Labs\",\n        \"url\": \"https://www.elastic.co/security-labs/rss/feed.xml\"\n    },\n    {\n        \"source\": \"CrowdStrike\",\n        \"url\": \"https://www.crowdstrike.com/en-us/blog/feed/\"\n    },\n    {\n        \"source\": \"Zscaler ThreatLabz\",\n        \"url\": \"https://www.zscaler.com/blogs/feeds/security-research\"\n    },\n    {\n        \"source\": \"Proofpoint\",\n        \"url\": \"https://www.proofpoint.com/us/rss.xml\"\n    },\n    {\n        \"source\": \"Rapid7\",\n        \"url\": \"https://blog.rapid7.com/rss/\"\n    },\n    {\n        \"source\": \"SentinelLabs\",\n        \"url\": \"https://www.sentinelone.com/labs/feed/\"\n    },\n    {\n        \"source\": \"Recorded Future\",\n        \"url\": \"https://www.recordedfuture.com/feed\"\n    },\n    {\n        \"source\": \"GreyNoise\",\n        \"url\": \"https://www.greynoise.io/blog/rss.xml\"\n    },\n    {\n        \"source\": \"Wordfence\",\n        \"url\": \"https://www.wordfence.com/feed/\"\n    },\n    {\n        \"source\": \"The Register\",\n        \"url\": \"https://www.theregister.com/security/headlines.atom\"\n    },\n    {\n        \"source\": \"Security Affairs\",\n        \"url\": \"https://securityaffairs.com/feed\"\n    },\n    {\n        \"source\": \"Infosecurity Magazine\",\n        \"url\": \"https://www.infosecurity-magazine.com/rss/news/\"\n    },\n    {\n        \"source\": \"Help Net Security\",\n        \"url\": \"https://www.helpnetsecurity.com/feed/\"\n    },\n    {\n        \"source\": \"CyberScoop\",\n        \"url\": \"https://cyberscoop.com/feed/\"\n    },\n    {\n        \"source\": \"IT Security Guru\",\n        \"url\": \"https://www.itsecurityguru.org/feed/\"\n    },\n    {\n        \"source\": \"Graham Cluley\",\n        \"url\": \"https://grahamcluley.com/feed/\"\n    },\n    {\n        \"source\": \"Troy Hunt\",\n        \"url\": \"https://www.troyhunt.com/rss/\"\n    },\n    {\n        \"source\": \"Darknet\",\n        \"url\": \"https://www.darknet.org.uk/feed/\"\n    },\n    {\n        \"source\": \"Google Security Blog\",\n        \"url\": \"https://security.googleblog.com/feeds/posts/default?alt=rss\"\n    },\n    {\n        \"source\": \"Cisco Security Blog\",\n        \"url\": \"https://blogs.cisco.com/security/feed\"\n    },\n    {\n        \"source\": \"Qualys\",\n        \"url\": \"https://blog.qualys.com/feed\"\n    },\n    {\n        \"source\": \"McAfee Labs\",\n        \"url\": \"https://www.mcafee.com/blogs/feed/\"\n    },\n    {\n        \"source\": \"Kaspersky\",\n        \"url\": \"https://www.kaspersky.com/blog/feed/\"\n    },\n    {\n        \"source\": \"NETSCOUT\",\n        \"url\": \"https://www.netscout.com/rss.xml\"\n    },\n    {\n        \"source\": \"CERT/CC\",\n        \"url\": \"https://www.kb.cert.org/vulfeed/\"\n    },\n    {\n        \"source\": \"CIS Advisories\",\n        \"url\": \"https://www.cisecurity.org/feed/advisories\"\n    }\n]\n} }];"
+      },
+      "id": "ff1eaa20-90ca-5633-8d1a-3b670509ae52",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://openrouter.ai/api/v1/models",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "d336c21e-b0f4-5eb3-a3c3-5f34dfdf9720",
+      "name": "OpenRouter Models",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        -160
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Public catalogue, no auth. Feeds the free-model ranking."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rank OpenRouter's live \":free\" catalogue for synthesis. Preferred (verified) models first, then models that\n// advertise structured outputs, then by context and size. Falls back to the preferred list if the catalogue fetch failed.\nconst cfg = $('Config').first().json;\nconst pref = cfg.openrouter_preferred || [];\nconst minCtx = cfg.openrouter_min_context || 32000;\nconst body = ($json && $json.body !== undefined) ? $json.body : $json;\nconst catalogue = body && Array.isArray(body.data) ? body.data : null;\nif (!catalogue) {\n  return [{ json: { fetched: false, count: pref.length, models: pref.map(id => ({ id, structured: true, strict: true, context: 0, score: 0 })), note: 'OpenRouter catalogue unavailable: using preferred list only' } }];\n}\nconst models = catalogue.filter(m => /:free$/.test(m.id || '')).map(m => {\n  const sp = m.supported_parameters || [];\n  const strict = sp.includes('structured_outputs'), rf = sp.includes('response_format');\n  const ctx = Number(m.context_length) || 0;\n  const maxOut = Number(m.top_provider && m.top_provider.max_completion_tokens) || 0;\n  const sizeM = String(m.id).match(/(\\d+(?:\\.\\d+)?)b\\b/i); const sizeB = sizeM ? parseFloat(sizeM[1]) : 0;   // \"2.6b\" is 2.6, not 6\n  const pi = pref.indexOf(m.id);\n  let score = 0;\n  if (pi >= 0) score += 1000 - pi * 10;\n  if (strict) score += 300; else if (rf) score += 150;\n  if (ctx >= 100000) score += 50; else if (ctx >= minCtx) score += 20;\n  if (maxOut >= 8000) score += 20;\n  score += Math.min(sizeB, 400) / 10;\n  if (/safety|guard|moderation|code|coder|vision|embed|rerank/i.test(m.id)) score -= 400;   // classifiers / code / vision models: always last\n  if (sizeB && sizeB < 4) score -= 100;                                                    // sub-4B models summarise poorly\n  return { id: m.id, name: m.name, context: ctx, structured: strict || rf, strict, max_output: maxOut, score };\n}).filter(m => m.context >= minCtx).sort((a, b) => b.score - a.score);\nreturn [{ json: { fetched: true, count: models.length, total_free: catalogue.filter(m => /:free$/.test(m.id || '')).length, models } }];"
+      },
+      "id": "a72cc421-448f-54a9-b3c6-06a769fa2f86",
+      "name": "Rank Free Models",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.groq.com/openai/v1/models",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + ($env.GROQ_API_KEY || '') }}"
+            }
+          ]
+        }
+      },
+      "id": "1ddc59be-428c-5c9c-ac71-b75f5853105f",
+      "name": "Groq Models",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        -160
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Groq model list (needs the key). Feeds the Groq ranking; failure -> preferred list."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rank Groq's model list for synthesis: preferred (chat-capable, known good) first, then context/size; exclude\n// audio, guard, compound, embedding and reasoning-distill models. Falls back to the preferred list on fetch failure.\nconst cfg = $('Config').first().json;\nconst pref = cfg.groq_preferred || [];\nconst minCtx = cfg.groq_min_context || 32000;\nconst body = ($json && $json.body !== undefined) ? $json.body : $json;\nconst catalogue = body && Array.isArray(body.data) ? body.data : null;\nif (!catalogue) {\n  return [{ json: { fetched: false, count: pref.length, models: pref.map(id => ({ id, strict: true, structured: true, context: 0, score: 0 })), note: 'Groq catalogue unavailable: using preferred list only' } }];\n}\nconst EXCL = /whisper|tts|guard|compound|embed|moderation|safeguard|orpheus|playai|allam|vision-preview/i;\nconst models = catalogue.filter(m => m.active !== false && !EXCL.test(m.id || '')).map(m => {\n  const ctx = Number(m.context_window) || 0;\n  const sizeM = String(m.id).match(/(\\d+(?:\\.\\d+)?)b\\b/i); const sizeB = sizeM ? parseFloat(sizeM[1]) : 0;\n  const pi = pref.indexOf(m.id);\n  let score = 0;\n  if (pi >= 0) score += 1000 - pi * 10;\n  if (ctx >= 100000) score += 50; else if (ctx >= minCtx) score += 20;\n  score += Math.min(sizeB, 400) / 10;\n  if (/instant|mini|small/i.test(m.id) && sizeB && sizeB < 10) score -= 30;\n  if (/distill|r1|reasoning/i.test(m.id)) score -= 60;\n  return { id: m.id, owned_by: m.owned_by, context: ctx, strict: true, structured: true, score };\n}).filter(m => m.context >= minCtx).sort((a, b) => b.score - a.score);\nreturn [{ json: { fetched: true, count: models.length, total: catalogue.length, models } }];"
+      },
+      "id": "5703649b-39fc-59f4-935a-d4439b57c3ea",
+      "name": "Rank Groq Models",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Config').first().json.qdrant_url }}/collections/{{ $('Config').first().json.collection }}",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ vectors: { size: $('Config').first().json.embed_dim, distance: 'Cosine' } }) }}"
+      },
+      "id": "eff2e8c9-58e7-5345-9e43-311e7fc1c8c8",
+      "name": "Ensure Collection",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "409 when the collection already exists — expected, hence continue-on-error."
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "={{ $('Config').first().json.attack_map_path }}",
+        "options": {}
+      },
+      "id": "77ea634c-1c82-582d-9fea-dca075118fde",
+      "name": "Read ATTACK Map",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "id": "b8bf735b-ea05-519d-ab85-db017969f1f3",
+      "name": "ATTACK Map",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $('Config').first().json.feeds.map(f => ({ json: f }));"
+      },
+      "id": "857e4165-560e-5860-8ec5-606842631b5a",
+      "name": "Split Feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "id": "1c3a0956-8a7f-5416-b592-482accf84bdc",
+      "name": "RSS Read",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Config').first().json;\nconst cutoff = Date.now() - cfg.lookback_hours * 3600 * 1000;\nconst HOST_MAP = {\n  \"bleepingcomputer.com\": \"BleepingComputer\",\n  \"thehackernews.com\": \"The Hacker News\",\n  \"securityweek.com\": \"SecurityWeek\",\n  \"darkreading.com\": \"Dark Reading\",\n  \"therecord.media\": \"The Record\",\n  \"krebsonsecurity.com\": \"Krebs on Security\",\n  \"isc.sans.edu\": \"SANS ISC\",\n  \"cisa.gov\": \"CISA\",\n  \"unit42.paloaltonetworks.com\": \"Unit 42\",\n  \"blog.talosintelligence.com\": \"Cisco Talos\",\n  \"schneier.com\": \"Schneier on Security\",\n  \"microsoft.com\": \"Microsoft Security\",\n  \"research.checkpoint.com\": \"Check Point Research\",\n  \"welivesecurity.com\": \"ESET WeLiveSecurity\",\n  \"malwarebytes.com\": \"Malwarebytes Labs\",\n  \"huntress.com\": \"Huntress\",\n  \"elastic.co\": \"Elastic Security Labs\",\n  \"crowdstrike.com\": \"CrowdStrike\",\n  \"zscaler.com\": \"Zscaler ThreatLabz\",\n  \"proofpoint.com\": \"Proofpoint\",\n  \"rapid7.com\": \"Rapid7\",\n  \"sentinelone.com\": \"SentinelLabs\",\n  \"recordedfuture.com\": \"Recorded Future\",\n  \"greynoise.io\": \"GreyNoise\",\n  \"wordfence.com\": \"Wordfence\",\n  \"theregister.com\": \"The Register\",\n  \"securityaffairs.com\": \"Security Affairs\",\n  \"infosecurity-magazine.com\": \"Infosecurity Magazine\",\n  \"helpnetsecurity.com\": \"Help Net Security\",\n  \"cyberscoop.com\": \"CyberScoop\",\n  \"itsecurityguru.org\": \"IT Security Guru\",\n  \"grahamcluley.com\": \"Graham Cluley\",\n  \"troyhunt.com\": \"Troy Hunt\",\n  \"darknet.org.uk\": \"Darknet\",\n  \"security.googleblog.com\": \"Google Security Blog\",\n  \"blogs.cisco.com\": \"Cisco Security Blog\",\n  \"blog.qualys.com\": \"Qualys\",\n  \"mcafee.com\": \"McAfee Labs\",\n  \"kaspersky.com\": \"Kaspersky\",\n  \"netscout.com\": \"NETSCOUT\",\n  \"kb.cert.org\": \"CERT/CC\",\n  \"cisecurity.org\": \"CIS Advisories\"\n};\nconst strip = h => String(h || '')\n  .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, ' ')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/&quot;/g, '\"').replace(/&#0?39;|&#x27;|&apos;/g, \"'\")\n  .replace(/&#(\\d+);/g, (m, n) => String.fromCharCode(+n))\n  .replace(/\\s+/g, ' ').trim();\n// No `URL` global in the n8n task-runner sandbox — regex only.\nconst TRACKING = /^(utm_[a-z]+|ref|source|mc_cid|mc_eid|fbclid|gclid)=/i;\nconst canon = u => {\n  let s = String(u || '').trim().replace(/#.*$/, '');\n  const m = s.match(/^([a-z][a-z0-9+.-]*:\\/\\/)([^/?#]+)(.*)$/i);\n  if (!m) return s;\n  let rest = m[3];\n  const qi = rest.indexOf('?');\n  if (qi >= 0) {\n    const kept = rest.slice(qi + 1).split('&').filter(p => p && !TRACKING.test(p));\n    rest = rest.slice(0, qi) + (kept.length ? '?' + kept.join('&') : '');\n  }\n  return m[1].toLowerCase() + m[2].toLowerCase() + rest;\n};\nconst hostOf = u => ((String(u).match(/^[a-z][a-z0-9+.-]*:\\/\\/([^/?#:]+)/i) || [])[1] || '').toLowerCase().replace(/^www\\./, '');\nconst seenUrl = new Set(), seenTitle = new Set(), out = [];\nfor (const it of $input.all()) {\n  const j = it.json;\n  if (!j || j.error || !j.link) continue;\n  const url = canon(j.link);\n  if (seenUrl.has(url)) continue;\n  const pub = new Date(j.isoDate || j.pubDate || j.published || j.updated || 0);\n  if (isNaN(pub.getTime()) || pub.getTime() < cutoff) continue;\n  const title = strip(j.title);\n  const tkey = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();\n  if (tkey && seenTitle.has(tkey)) continue;\n  const host = hostOf(url);\n  const hit = Object.entries(HOST_MAP).find(([k]) => host === k || host.endsWith('.' + k));\n  const source = hit ? hit[1] : host;\n  const rssHtml = j['content:encoded'] || j.content || j.summary || j.description || j.contentSnippet || '';\n  const categories = Array.isArray(j.categories) ? j.categories.map(c => typeof c === 'string' ? c : (c && (c._ || c.name)) || '').filter(Boolean) : [];\n  seenUrl.add(url); if (tkey) seenTitle.add(tkey);\n  out.push({ json: { url, title, source, published: pub.toISOString(), rss_text: strip(rssHtml).slice(0, cfg.max_article_chars), categories } });\n}\nout.sort((a, b) => b.json.published.localeCompare(a.json.published));\nreturn out;"
+      },
+      "id": "65f3ee65-c08f-57e4-b73b-4224817f17a1",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "let __crypto = null; try { __crypto = require('crypto'); } catch (e) { __crypto = null; }\nfunction uuidFrom(str) {\n  let hex;\n  if (__crypto) { hex = __crypto.createHash('sha256').update(String(str)).digest('hex').slice(0, 32); }\n  else {\n    hex = '';\n    for (let s = 0; s < 4; s++) {\n      let h = (0x811c9dc5 ^ (s * 0x9e3779b1)) >>> 0;\n      for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }\n      hex += h.toString(16).padStart(8, '0');\n    }\n  }\n  hex = hex.slice(0, 12) + '5' + hex.slice(13, 16) + ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16) + hex.slice(17, 32);\n  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;\n}\n\n// One item out: the batch of candidate articles + their deterministic Qdrant point ids.\nconst articles = $input.all().map(i => i.json);\nfor (const a of articles) a.id = uuidFrom('article:' + a.url);\nreturn [{ json: { ids: articles.map(a => a.id), articles } }];"
+      },
+      "id": "fc4ffe42-2f81-5ac4-9187-060c2c17546c",
+      "name": "Compute IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.qdrant_url }}/collections/{{ $('Config').first().json.collection }}/points",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ids: $json.ids, with_payload: true, with_vector: false }) }}"
+      },
+      "id": "c4d5b322-b1c4-54e2-8b1d-afc87a1af230",
+      "name": "Qdrant: Retrieve Existing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Drop anything already in Qdrant (i.e. already digested on a previous run).\nconst found = new Set((($json && $json.result) || []).map(p => p.id));\nconst articles = $('Compute IDs').first().json.articles;\nreturn articles.filter(a => !found.has(a.id)).map(a => ({ json: a }));"
+      },
+      "id": "373eec18-3545-5aef-87e1-f541a11a4551",
+      "name": "Filter New",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "options": {
+          "timeout": 20000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 5
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 4,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.9"
+            }
+          ]
+        }
+      },
+      "id": "22709b16-a023-5524-8c36-3648fe838160",
+      "name": "Fetch Article",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const meta = $('Filter New').item.json;\nconst cfg = $('Config').first().json;\n// HTTP Request (fullResponse + text) emits { data, headers, statusCode, statusMessage }; the page is in `data`.\nconst status = Number($json.statusCode || 0);\nconst html = (typeof $json.data === 'string') ? $json.data : ((typeof $json.body === 'string') ? $json.body : '');\n\nconst decode = s => String(s)\n  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/&quot;/g, '\"').replace(/&#0?39;|&#x27;|&apos;/g, \"'\")\n  .replace(/&#(\\d+);/g, (m, n) => String.fromCharCode(+n))\n  .replace(/&#x([0-9a-f]+);/gi, (m, n) => String.fromCharCode(parseInt(n, 16)))\n  .replace(/&[a-z]+;/gi, ' ');\nconst textOf = frag => decode(String(frag)\n  .replace(/<(script|style|noscript|svg|iframe|form|nav|footer|header|aside|figure|button)\\b[\\s\\S]*?<\\/\\1>/gi, ' ')\n  .replace(/<!--[\\s\\S]*?-->/g, ' ')\n  .replace(/<br\\s*\\/?>|<\\/(p|div|li|h[1-6]|tr|blockquote|pre|section)>/gi, '\\n')\n  .replace(/<[^>]+>/g, ' '))\n  .replace(/[ \\t ]+/g, ' ').replace(/\\s*\\n\\s*/g, '\\n').trim();\n\nlet text = '';\nif (status >= 200 && status < 300 && html) {\n  const pick = re => { const m = html.match(re); return m ? m[1] : null; };\n  for (const c of [pick(/<article\\b[^>]*>([\\s\\S]*?)<\\/article>/i), pick(/<main\\b[^>]*>([\\s\\S]*?)<\\/main>/i), pick(/<body\\b[^>]*>([\\s\\S]*?)<\\/body>/i), html]) {\n    if (!c) continue; const t = textOf(c); if (t.length > 800) { text = t; break; }\n  }\n}\n// Cut trailing page chrome (\"Related Articles\", share prompts, trending widgets) so their CVEs/IOCs\n// don't contaminate this story. Only cut if the marker sits past the first third of the text.\nconst CHROME = /\\n\\s*(Related Articles?:?|Related:|Related Stories|Related Posts|Trending|Popular Stories|Read more:?|Read Next|You may also like|Recommended( for you)?|More from|Found this article interesting\\?|Share (this|on)|Follow us|Sponsored|Advertisement|Tags:|Comments?( \\(\\d+\\))?|Post a Comment|Subscribe)\\b/i;\nif (text) {\n  const m = text.match(CHROME);\n  if (m && m.index > text.length / 3) text = text.slice(0, m.index).trim();\n}\nlet text_source = text ? 'full' : 'rss';\nif (!text || text.length < 400) { text = meta.rss_text || text; text_source = 'rss'; }\ntext = String(text).slice(0, cfg.max_article_chars);\n\n// ---- deterministic extraction (the LLM is never trusted for identifiers) ----\nconst raw = meta.title + '\\n' + text;\nconst refang = s => String(s).replace(/\\[\\.\\]|\\(\\.\\)|\\{\\.\\}/g, '.').replace(/\\[:\\]/g, ':').replace(/\\[at\\]|\\(at\\)/gi, '@').replace(/^hxxp/i, 'http');\nconst cves = [...new Set((raw.match(/\\bCVE-\\d{4}-\\d{4,7}\\b/gi) || []).map(s => s.toUpperCase()))];\nconst tids = [...new Set(raw.match(/\\bT\\d{4}(?:\\.\\d{3})?\\b/g) || [])];\nconst iocs = [];\nconst add = (type, value) => { const v = refang(value).toLowerCase().trim(); if (v && !iocs.some(i => i.value === v)) iocs.push({ type, value: v, method: 'regex' }); };\n(raw.match(/\\b[a-f0-9]{64}\\b/gi) || []).forEach(v => add('sha256', v));\n(raw.match(/\\b[a-f0-9]{40}\\b/gi) || []).forEach(v => add('sha1', v));\n(raw.match(/\\b[a-f0-9]{32}\\b/gi) || []).forEach(v => add('md5', v));\n// defanged forms: authors defang either every dot or just the last one, so accept a mix but require at least one [.]\n(raw.match(/\\bhxxps?:\\/\\/[^\\s\"'<>]+/gi) || []).map(v => v.replace(/[.,;:)]+$/, '')).forEach(v => add('url', v));\n(raw.match(/\\b(?:\\d{1,3}(?:\\[\\.\\]|\\.)){3}\\d{1,3}\\b/g) || []).filter(v => v.includes('[.]')).forEach(v => add('ipv4', v));\n(raw.match(/\\b(?:[a-z0-9-]+(?:\\[\\.\\]|\\.))+[a-z]{2,}\\b/gi) || []).filter(v => v.includes('[.]')).forEach(v => add('domain', v));\n// plain public IPv4 - skip version-number look-alikes (all octets < 32 or preceded by version words)\nconst ipRe = /(.{0,12})\\b((?:\\d{1,3}\\.){3}\\d{1,3})\\b/g; let m;\nwhile ((m = ipRe.exec(raw)) !== null) {\n  const p = m[2].split('.').map(Number);\n  if (p.some(n => n > 255) || !p.some(n => n >= 32)) continue;\n  if (/(version|release|build|firmware|v\\.?\\s*$|ver\\.?\\s*$)/i.test(m[1])) continue;\n  if (p[0] === 10 || p[0] === 127 || p[0] === 0 || (p[0] === 192 && p[1] === 168) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 169 && p[1] === 254) || p[0] >= 224) continue;\n  add('ipv4', m[2]);\n}\nreturn { json: { ...meta, text, text_source, http_status: status, cves, tids, iocs } };"
+      },
+      "id": "af442a80-0785-5fff-88ca-d1347c4d0801",
+      "name": "Extract Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.lmstudio_url }}/embeddings",
+        "options": {
+          "timeout": 180000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 100
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('Config').first().json.embed_model, input: ($('Config').first().json.embed_prefix || '') + $json.title + '\\n' + String($json.text).slice(0, 2000) }) }}"
+      },
+      "id": "a850edb6-3273-5eff-9ef3-d5cb74372340",
+      "name": "Embed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "LM Studio only (no free cloud embedding model). If it is down the item passes through with an error and the run degrades to lexical clustering."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const a = $('Extract Text').item.json;\nconst vec = $json && $json.data && $json.data[0] && $json.data[0].embedding;\n// Embeddings come only from LM Studio (no free cloud embedding model exists on OpenRouter; Groq has none). If it is\n// down or answers garbage, keep the article: clustering falls back to lexical evidence and the Qdrant record gets a\n// placeholder vector flagged embedded:false, so dedup-by-id still works and the run ships (2026-09-11).\nif (!Array.isArray(vec)) return { json: { ...a, vector: null, embedded: false, embed_error: String(($json && $json.error && ($json.error.message || $json.error)) || 'malformed embedding response').slice(0, 200) } };\nreturn { json: { ...a, vector: vec, embedded: true } };"
+      },
+      "id": "e3d41d44-2333-5077-9b42-4e52f85a1794",
+      "name": "Attach Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Config').first().json;\nconst arts = $input.all().map(i => i.json);\n// Only embedded articles are searched; positions maps article id -> index in the batch (Cluster needs it). Placeholder\n// points from degraded runs are excluded from prior-story matching via the embedded:false filter.\nconst positions = {}; const searches = [];\nfor (const a of arts) { if (!Array.isArray(a.vector)) continue; positions[a.id] = searches.length;\n  searches.push({ vector: a.vector, limit: 3, score_threshold: cfg.prior_similarity_threshold, with_payload: true, with_vector: false, filter: { must_not: [{ key: 'embedded', match: { value: false } }] } }); }\nreturn [{ json: { searches, positions, unembedded: arts.length - searches.length } }];"
+      },
+      "id": "dd064702-ab68-5277-acd6-cb5d4db9f00a",
+      "name": "Search Prior Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.qdrant_url }}/collections/{{ $('Config').first().json.collection }}/points/search/batch",
+        "options": {
+          "timeout": 60000
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ searches: $json.searches }) }}"
+      },
+      "id": "551a9df1-6e6e-535b-8f60-68ad1f9dcefa",
+      "name": "Qdrant: Search Prior",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Config').first().json;\nconst arts = $('Attach Embedding').all().map(i => i.json);\nconst prior = ($json && $json.result) || [];\nlet positions = {}; try { positions = $('Search Prior Body').first().json.positions || {}; } catch (e) { arts.forEach((a, i) => { positions[a.id] = i; }); }\nconst n = arts.length;\nconst parent = [...Array(n).keys()];\nconst find = x => parent[x] === x ? x : (parent[x] = find(parent[x]));\nconst union = (a, b) => { a = find(a); b = find(b); if (a !== b) parent[b] = a; };\nconst cos = (u, v) => { let d = 0, nu = 0, nv = 0; for (let i = 0; i < u.length; i++) { d += u[i] * v[i]; nu += u[i] * u[i]; nv += v[i] * v[i]; } return d / (Math.sqrt(nu) * Math.sqrt(nv) || 1); };\n// Security headlines are templated (\"Critical X flaw exploited in attacks\"), so short excerpts embed alike.\n// Require lexical evidence (shared CVE or >=2 distinctive title tokens) unless the vectors are near-identical.\nconst STOP = new Set(['critical', 'vulnerability', 'vulnerabilities', 'flaw', 'flaws', 'attack', 'attacks', 'attackers', 'hackers', 'security',\n  'exploited', 'exploit', 'exploits', 'patches', 'patch', 'patched', 'fixes', 'fix', 'new', 'zero', 'zero-day', 'bug', 'bugs', 'data', 'breach',\n  'users', 'malware', 'threat', 'threats', 'actors', 'campaign', 'targets', 'targeting', 'warns', 'urges', 'report', 'researchers', 'million',\n  'thousands', 'with', 'from', 'that', 'this', 'into', 'over', 'after', 'amid', 'their', 'your', 'have', 'been', 'says', 'could', 'more',\n  'update', 'updates', 'issue', 'issues', 'high', 'severity', 'remote', 'code', 'execution', 'lets', 'allows', 'used', 'using', 'wild']);\nconst toks = t => new Set(String(t).toLowerCase().replace(/[^a-z0-9.\\-\\s]/g, ' ').split(/\\s+/).filter(w => w.length >= 4 && !STOP.has(w) && !/^\\d+$/.test(w)));\nconst titleToks = arts.map(a => toks(a.title));\nconst sharedTokens = (i, j) => { let k = 0; for (const w of titleToks[i]) if (titleToks[j].has(w)) k++; return k; };\n// ---- Reranker (Qwen3-Reranker-4B via LM Studio). The model's documented prompt, sent to the RAW /completions endpoint\n// with the <think> block pre-closed: through /chat/completions LM Studio applies Qwen3's thinking template and the model\n// reasons for its whole token budget without ever answering (verified 2026-09-11). LM Studio returns no logprobs, so\n// the decision is the generated word: \"yes\" -> 1, \"no\" -> 0. Any failure = no decision (thresholds stand); the run\n// never stops for it.\nconst rr = { enabled: !!cfg.reranker_enabled && !!(this && this.helpers && this.helpers.httpRequest), asked: 0, merged: 0, rejected: 0, prior_confirmed: 0, prior_rejected: 0, errors: 0, skipped_cap: 0 };\nconst http = rr.enabled ? (o => this.helpers.httpRequest(o)) : null;\nconst RR_SYSTEM = 'Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".';\nconst snippet = a => `${a.title}\\n${String(a.text || '').replace(/\\s+/g, ' ').slice(0, 700)}`;\nconst rerank = async (instruct, query, doc) => {\n  rr.asked++;\n  try {\n    const prompt = `<|im_start|>system\\n${RR_SYSTEM}<|im_end|>\\n<|im_start|>user\\n<Instruct>: ${instruct}\\n<Query>: ${query}\\n<Document>: ${doc}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n`;\n    const res = await http({ method: 'POST', url: cfg.lmstudio_url + '/completions', headers: { 'Content-Type': 'application/json' }, json: true, timeout: 60000, returnFullResponse: true, ignoreHttpStatusErrors: true,\n      body: { model: cfg.reranker_model, prompt, temperature: 0, max_tokens: 3, stop: ['<|im_end|>', '\\n'] } });\n    const st = Number(res && res.statusCode) || 0, b = (res && res.body) || {};\n    if (st < 200 || st >= 300 || !b.choices || !b.choices[0]) throw new Error('HTTP ' + st + ' ' + ((b.error && b.error.message) || ''));\n    const text = String(b.choices[0].text || (b.choices[0].message && b.choices[0].message.content) || '').replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim().toLowerCase();\n    const pYes = /^yes/.test(text) ? 1 : (/^no/.test(text) ? 0 : null);\n    if (pYes === null) throw new Error('no yes/no in answer: ' + text.slice(0, 40));\n    return pYes;\n  } catch (e) { rr.errors++; rr.last_error = String(e.message || e).slice(0, 120); return null; }\n};\nconst borderline = [];\nfor (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {\n  const sharedCve = arts[i].cves.some(c => arts[j].cves.includes(c));\n  const shared = sharedTokens(i, j);\n  if (!Array.isArray(arts[i].vector) || !Array.isArray(arts[j].vector)) {\n    // No vector on one side (LM Studio down): lexical evidence only, held to a stricter bar.\n    if (sharedCve || shared >= 3) union(i, j);\n    continue;\n  }\n  const s = cos(arts[i].vector, arts[j].vector);\n  const lexical = sharedCve || shared >= 2;\n  // Two articles that each name CVEs with none in common are different events (same vendor, different bug) — never\n  // merged by vectors or by the reranker, which was seen to say \"yes\" to FortiOS CVE-A vs FortiManager CVE-B.\n  const cveConflict = arts[i].cves.length > 0 && arts[j].cves.length > 0 && !sharedCve;\n  if (cveConflict) continue;\n  if (s >= cfg.similarity_threshold_hard || (lexical && s >= cfg.similarity_threshold)) union(i, j);\n  else if (rr.enabled && s >= (cfg.rerank_band_low || 0.70)) borderline.push([i, j, s]);\n}\n// Borderline pairs: closest first, capped per run, skipped once the union-find already joined them.\nborderline.sort((a, b) => b[2] - a[2]);\nfor (const [i, j, s] of borderline) {\n  if (find(i) === find(j)) continue;\n  if (rr.asked >= (cfg.rerank_max_pairs || 40)) { rr.skipped_cap++; continue; }\n  const p = await rerank('Determine whether the Document reports the SAME news event as the Query: the same incident, the same vulnerability (same CVE identifier), the same campaign or the same announcement. Answer no if they concern different CVE identifiers, different products, or merely the same vendor or topic.', snippet(arts[i]), snippet(arts[j]));\n  if (p === null) continue;\n  if (p >= 0.5) { union(i, j); rr.merged++; } else rr.rejected++;\n}\nconst groups = {};\narts.forEach((a, i) => { const r = find(i); (groups[r] = groups[r] || []).push(i); });\nconst uniq = arr => [...new Set(arr)];\nconst out = []; let k = 0;\nfor (const idxs of Object.values(groups)) {\n  k++;\n  const members = idxs.map(i => arts[i]);\n  const priorHits = [];\n  for (const i of idxs) { const k = positions[arts[i].id]; if (k === undefined) continue; for (const h of (prior[k] || [])) {\n    if (!h || !h.payload || priorHits.some(p => p.id === h.id)) continue;\n    if (members.some(m => m.id === h.id)) continue;\n    // Prior-story candidates, deterministic rules first: disjoint CVE sets veto; a shared CVE confirms; otherwise the\n    // reranker's \"yes\" counts only with corroboration (a shared distinctive title token or a near-identical vector),\n    // and without the reranker the same corroboration is required on its own.\n    const priorCves = Array.isArray(h.payload.cves) ? h.payload.cves : [];\n    const sharedPriorCve = arts[i].cves.some(c => priorCves.includes(c));\n    if (arts[i].cves.length && priorCves.length && !sharedPriorCve) { rr.prior_rejected_cve = (rr.prior_rejected_cve || 0) + 1; continue; }\n    const priorToks = toks(h.payload.title || ''); let sharedPriorToks = 0; for (const w of titleToks[i]) if (priorToks.has(w)) sharedPriorToks++;\n    const corroborated = sharedPriorCve || sharedPriorToks >= 1 || Number(h.score) >= cfg.similarity_threshold_hard;\n    if (!sharedPriorCve) {\n      if (rr.enabled && cfg.rerank_prior_links) { const p = await rerank('Determine whether the Document is an earlier report of the same news event as the Query (a continuation or update), not merely a related topic.', snippet(arts[i]), `${h.payload.title || ''} (${h.payload.source || ''}, ${h.payload.digest_date || ''})`);\n        if (p !== null && p < 0.5) { rr.prior_rejected++; continue; }\n        if (p !== null && !corroborated) { rr.prior_rejected_uncorroborated = (rr.prior_rejected_uncorroborated || 0) + 1; continue; }\n        if (p !== null) rr.prior_confirmed++; else if (!corroborated) continue; }\n      else if (!corroborated) { rr.prior_rejected_uncorroborated = (rr.prior_rejected_uncorroborated || 0) + 1; continue; }\n    }\n    priorHits.push({ id: h.id, score: h.score, title: h.payload.title, url: h.payload.url, source: h.payload.source, digest_date: h.payload.digest_date, cluster_id: h.payload.cluster_id, misp_event_id: h.payload.misp_event_id || null, misp_event_uuid: h.payload.misp_event_uuid || null, evidence: sharedPriorCve ? 'shared CVE' : (sharedPriorToks ? 'title overlap' : 'near-identical vector') });\n  } }\n  out.push({ json: {\n    cluster_id: `${cfg.run_date}-${String(k).padStart(2, '0')}`,\n    run_date: cfg.run_date,\n    article_ids: members.map(m => m.id),\n    articles: members.map(m => ({ id: m.id, url: m.url, title: m.title, source: m.source, published: m.published, text: m.text, text_source: m.text_source })),\n    cves: uniq(members.flatMap(m => m.cves)),\n    tids: uniq(members.flatMap(m => m.tids)),\n    iocs: members.flatMap(m => m.iocs).filter((v, i, a) => a.findIndex(x => x.value === v.value) === i),\n    prior: priorHits.sort((a, b) => b.score - a.score).slice(0, 3),\n    is_update: priorHits.length > 0,\n  } });\n}\nout.sort((a, b) => b.json.articles.length - a.json.articles.length);\nif (out.length) out[0].json.rerank = rr;   // stats for the run notes\nreturn out;"
+      },
+      "id": "a97702f1-eabc-5455-b47d-fed40720c483",
+      "name": "Cluster",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const cfg = $('Config').first().json;\nconst c = $json;\nconst per = Math.max(1500, Math.floor(cfg.max_cluster_chars / Math.max(1, c.articles.length)));\nconst docs = c.articles.map((a, i) =>\n  `### Source ${i + 1}: ${a.source} — \"${a.title}\"\\nURL: ${a.url}\\nPublished: ${a.published}\\n\\n${String(a.text || '').slice(0, per)}`\n).join('\\n\\n');\nconst priorNote = c.is_update\n  ? `\\n\\nNOTE: This continues a story already digested earlier: ${c.prior.map(p => `\"${p.title}\" (${p.source}, ${p.digest_date})`).join('; ')}. Put what is NEW in the whats_new field and keep the summary focused on developments.`\n  : '';\nconst system = `You are a senior cyber threat intelligence analyst producing a daily consolidated brief for security engineers.\nYou receive one or more news articles covering the same story from different outlets. Merge them into ONE complete picture: combine every fact, reconcile discrepancies (list them in source_discrepancies), do not repeat yourself, no marketing language.\nRules:\n- Only state facts present in the sources. Never invent CVE numbers, indicators, or ATT&CK IDs.\n- ATT&CK: list techniques only for behaviours the sources EXPLICITLY describe (an attacker exploited a public-facing app, dumped credentials, used a scheduled task...). Never list a technique because it is \"implied\", \"potential\", or a risk. Give the official technique_name exactly as MITRE writes it (sub-techniques as \"Parent: Sub\", e.g. \"Phishing: Spearphishing Link\", \"Command and Scripting Interpreter: PowerShell\"); the name is what gets matched, the attack_id is a hint. Unmatched names are dropped, so precision matters more than recall.\n- IOCs: only values the articles present as attacker infrastructure, malware hashes, malicious URLs/files. Never the outlets' own domains, vendor sites, or product names. Write them refanged (a.b.c not a[.]b[.]c).\n- Severity — be conservative, most stories are medium or below:\n  critical = confirmed active exploitation of a widely deployed product, or a major incident affecting many organisations;\n  high = new vulnerability with public exploit / KEV, an active campaign with IOCs, or a significant breach;\n  medium = notable vulnerability or incident with limited scope or no known exploitation;\n  low = minor bug, product outage, small incident, industry news;\n  info = opinion, research paper, policy, funding, events, tooling announcements, think-pieces.\n- threat_actors: ONLY named adversary groups or aliases (e.g. \"Scattered Spider\", \"APT29\", \"LockBit\"). Never researchers, vendors, victims, generic words like \"attackers\", or \"Unknown\" — use an empty array instead.\n- malware: only named families/tools (e.g. \"Cobalt Strike\", \"COATHANGER\"). Empty array if none are named.\n- whats_new: empty string unless the NOTE above says this continues an earlier story.\n- source_discrepancies: empty array unless two sources actually contradict each other.\n- key_facts: short, dense bullets. Attribute when sources disagree (\"BleepingComputer says X, The Record says Y\").\n- recommended_actions: concrete defensive steps (patch versions, hunt queries, config changes). Empty array if none apply. Never write generic advice like \"apply patches\" when the source names none.\nRespond with a single JSON object matching the requested schema — no prose, no code fences.`;\n// Non-strict models never see response_format: spell the keys out in the prompt too.\nconst keySpec = `Return ONE JSON object with exactly these keys: headline (string), category (one of vulnerability|exploitation|breach|ransomware|malware|apt|phishing|supply-chain|policy|research|tooling|other), severity (one of critical|high|medium|low|info), summary (string), key_facts (string[]), whats_new (string), affected_products (string[]), cves (array of {id, context, exploited_in_wild:boolean}), iocs (array of {type: ipv4|ipv6|domain|url|sha256|sha1|md5|email|filename, value, context}), ttps (array of {technique_name, attack_id, behaviour}), threat_actors (string[]), malware (string[]), recommended_actions (string[]), source_discrepancies (string[]). Use [] or \"\" when nothing applies. No other keys.`;\nconst user = `Consolidate the following ${c.articles.length} article(s) into a single brief.${priorNote}\\n\\n${keySpec}\\n\\n${docs}`;\nconst schema = { type: 'object', additionalProperties: false, properties: {\n  headline: { type: 'string', description: 'One neutral headline for the consolidated story' },\n  category: { type: 'string', enum: ['vulnerability', 'exploitation', 'breach', 'ransomware', 'malware', 'apt', 'phishing', 'supply-chain', 'policy', 'research', 'tooling', 'other'] },\n  severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'] },\n  summary: { type: 'string', description: '3-7 sentences merging all sources' },\n  key_facts: { type: 'array', items: { type: 'string' } },\n  whats_new: { type: 'string', description: 'What is new versus earlier coverage; empty string if not an update' },\n  affected_products: { type: 'array', items: { type: 'string' } },\n  cves: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, context: { type: 'string' }, exploited_in_wild: { type: 'boolean' } }, required: ['id', 'context', 'exploited_in_wild'] } },\n  iocs: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['ipv4', 'ipv6', 'domain', 'url', 'sha256', 'sha1', 'md5', 'email', 'filename', 'other'] }, value: { type: 'string' }, context: { type: 'string' } }, required: ['type', 'value', 'context'] } },\n  ttps: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { technique_name: { type: 'string', description: 'Exact MITRE ATT&CK technique name, e.g. \"Exploit Public-Facing Application\" or \"Phishing: Spearphishing Attachment\"' }, attack_id: { type: 'string', description: 'ATT&CK id if known, e.g. T1190; empty string if unsure' }, behaviour: { type: 'string', description: 'What the sources say the attacker did' } }, required: ['technique_name', 'attack_id', 'behaviour'] } },\n  threat_actors: { type: 'array', items: { type: 'string' } },\n  malware: { type: 'array', items: { type: 'string' } },\n  recommended_actions: { type: 'array', items: { type: 'string' } },\n  source_discrepancies: { type: 'array', items: { type: 'string' } },\n}, required: ['headline', 'category', 'severity', 'summary', 'key_facts', 'whats_new', 'affected_products', 'cves', 'iocs', 'ttps', 'threat_actors', 'malware', 'recommended_actions', 'source_discrepancies'] };\nreturn { json: { ...c, request_body: {\n  model: cfg.chat_model, temperature: 0.1, max_tokens: cfg.max_output_tokens,\n  messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n  response_format: { type: 'json_schema', json_schema: { name: 'intel_brief', strict: true, schema } },\n} } };"
+      },
+      "id": "fc2ac2cc-0f48-5720-8d8e-32e3d7410a1c",
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One ordered pass over all story clusters. Per story, providers are tried in cfg.provider_order\n// (default openrouter -> groq -> lmstudio); within a hosted provider, models in ranked order.\n// Circuit breakers per provider: a failing model sits out a cooldown that doubles per strike (404/400 = out for\n// the run); an account-level condition (401/402, daily quota / tokens-per-day 429) benches the provider for the run.\n// Models that reject json_schema are retried once with json_object. Never throws: a story with no answer gets a soft error.\nconst cfg = $('Config').first().json;\nconst clusters = $input.all().map(i => i.json);\nconst http = o => this.helpers.httpRequest(o);\nconst sleep = ms => new Promise(r => setTimeout(r, ms));\nconst getEnv = k => { try { return String($env[k] || '').trim(); } catch (e) { return ''; } };\nconst getModels = node => { try { return $(node).first().json.models || []; } catch (e) { return []; } };\nconst notes = [];\nconst order = Array.isArray(cfg.provider_order) && cfg.provider_order.length ? cfg.provider_order : ['openrouter', 'groq', 'lmstudio'];\nconst providers = {\n  openrouter: { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: getEnv('OPENROUTER_API_KEY'), models: getModels('Rank Free Models'),\n    enabled: cfg.openrouter_enabled !== false, delay: cfg.openrouter_delay_ms || 600, cooldown: cfg.openrouter_cooldown_ms || 90000, timeout: cfg.openrouter_timeout_ms || 180000,\n    headers: { 'HTTP-Referer': 'http://localhost:5678', 'X-Title': 'CyberIntel Daily Digest' }, dailyRe: /per-day|daily|credits/i },\n  groq: { label: 'Groq', url: 'https://api.groq.com/openai/v1/chat/completions', key: getEnv('GROQ_API_KEY'), models: getModels('Rank Groq Models'),\n    enabled: cfg.groq_enabled !== false, delay: cfg.groq_delay_ms || 2100, cooldown: cfg.groq_cooldown_ms || 90000, timeout: cfg.groq_timeout_ms || 120000,\n    headers: {}, dailyRe: /per day|tokens per day|\\bTPD\\b|\\bRPD\\b|daily/i },\n};\nfor (const [name, p] of Object.entries(providers)) {\n  p.off = null; p.bench = new Map(); p.noStrict = new Set(); p.used = 0;\n  if (!order.includes(name)) p.off = `${p.label}: not in provider_order`;\n  else if (!p.enabled) p.off = `${p.label}: disabled in Config`;\n  else if (!p.key) p.off = `${p.label}: API key not set`;\n  else if (!p.models.length) p.off = `${p.label}: no eligible models`;\n  if (p.off) notes.push(p.off);\n}\nif (!order.includes('lmstudio')) notes.push('LM Studio: not in provider_order');\nlet lmUsed = 0;\nconst strike = (p, id, permanent) => { const b = p.bench.get(id) || { until: 0, strikes: 0 }; b.strikes++; b.until = permanent ? Infinity : Date.now() + p.cooldown * Math.pow(2, b.strikes - 1); p.bench.set(id, b); };\nconst benched = (p, id) => { const b = p.bench.get(id); return !!b && b.until > Date.now(); };\nconst contentOf = r => r && r.choices && r.choices[0] && r.choices[0].message && r.choices[0].message.content;\nconst finishOf = r => (r && r.choices && r.choices[0] && r.choices[0].finish_reason) || '';\n// Tolerant JSON: strip fences and \"{ {\" double braces, then fall back to the outermost {...}.\nconst extractJson = s => {\n  const t = String(s).replace(/^\\s*```(?:json)?\\s*|\\s*```\\s*$/g, '').replace(/^\\s*\\{\\s*\\{/, '{').trim();\n  try { JSON.parse(t); return t; } catch (e) {}\n  const a = t.indexOf('{'), z = t.lastIndexOf('}');\n  if (a >= 0 && z > a) { const sub = t.slice(a, z + 1); JSON.parse(sub); return sub; }\n  JSON.parse(t); // rethrow with the original message\n};\nconst buildBody = (p, m, req, useStrict) => {\n  const body = { ...req, model: m.id };\n  if (!(useStrict && m.strict)) { if (m.structured !== false) body.response_format = { type: 'json_object' }; else delete body.response_format; }\n  return body;\n};\n\n// Time budget (deterministic): the whole pass must fit cfg.synth_budget_ms so the node never outlives the runner's task\n// timeout. Each story gets an equal share of the remaining budget (never below synth_story_min_ms); hosted requests are\n// capped to the share, a story that overruns moves on to the next provider, and once the budget is spent the remaining\n// stories skip hosted providers and take one LM Studio try each.\nconst budgetMs = Number(cfg.synth_budget_ms) > 0 ? Number(cfg.synth_budget_ms) : 45 * 60 * 1000;\nconst storyMinMs = Number(cfg.synth_story_min_ms) > 0 ? Number(cfg.synth_story_min_ms) : 60000;\nconst runStart = Date.now(); let overBudgetStories = 0, overShareStories = 0;\nconst out = [];\nfor (let i = 0; i < clusters.length; i++) {\n  const c = clusters[i]; const attempts = []; let result = null;\n  const remaining = budgetMs - (Date.now() - runStart), share = Math.max(storyMinMs, remaining / (clusters.length - i));\n  const storyStart = Date.now(); const spent = () => Date.now() - storyStart; const overShare = () => spent() > share;\n  const budgetGone = remaining <= 0; if (budgetGone) overBudgetStories++;\n  for (const name of order) {\n    if (result) break;\n    if (name === 'lmstudio') {\n      const tries = budgetGone ? 1 : (cfg.lmstudio_tries || 3), backoff = cfg.lmstudio_backoff_ms == null ? 8000 : cfg.lmstudio_backoff_ms;\n      for (let t = 1; t <= tries && !result; t++) {\n        const started = Date.now();\n        try {\n          const r = await http({ method: 'POST', url: cfg.lmstudio_url + '/chat/completions', headers: { 'Content-Type': 'application/json' }, body: { ...c.request_body, model: cfg.chat_model }, json: true, timeout: Math.min(300000, Math.max(120000, share - spent())) });\n          const content = contentOf(r);\n          if (!content || !String(content).trim()) throw new Error('empty content');\n          result = { ...r, provider: 'lmstudio', model_used: cfg.chat_model, elapsed_ms: Date.now() - started };\n          lmUsed++;\n        } catch (e) {\n          attempts.push(`lmstudio/${cfg.chat_model}#${t}: ${String(e.message || e).replace(/\\s+/g, ' ').slice(0, 140)}`);\n          if (t < tries) await sleep(backoff * t);\n        }\n      }\n      continue;\n    }\n    const p = providers[name];\n    if (!p || p.off) continue;\n    if (budgetGone) { attempts.push(`${name}: skipped, synthesis budget spent (${Math.round(budgetMs / 60000)} min) — straight to LM Studio`); continue; }\n    if (overShare()) { attempts.push(`${name}: skipped, story share of ${Math.round(share / 1000)} s already spent`); overShareStories++; continue; }\n    let stopProvider = false;\n    for (const m of p.models) {\n      if (result || stopProvider) break;\n      if (benched(p, m.id)) continue;\n      if (overShare()) { attempts.push(`${name}: story share of ${Math.round(share / 1000)} s spent after ${p.used} success(es); moving on`); overShareStories++; break; }\n      let useStrict = !p.noStrict.has(m.id);\n      for (let pass = 0; pass < 2 && !result && !stopProvider; pass++) {\n        const started = Date.now();\n        let st = 0, rb = {};\n        try {\n          const res = await http({ method: 'POST', url: p.url, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.key, ...p.headers },\n            body: buildBody(p, m, c.request_body, useStrict), json: true, timeout: Math.min(p.timeout, Math.max(15000, share - spent())), returnFullResponse: true, ignoreHttpStatusErrors: true });\n          st = Number(res && res.statusCode) || 0;\n          rb = (res && res.body) || {};\n          const errMsg = rb.error ? String(rb.error.message || JSON.stringify(rb.error)) : '';\n          if (st === 401 || st === 402 || (st === 429 && p.dailyRe.test(errMsg))) {\n            p.off = `${p.label} benched after ${p.used} stor${p.used === 1 ? 'y' : 'ies'} (HTTP ${st}: ${errMsg.slice(0, 100)})`; notes.push(p.off);\n            attempts.push(`${name}/${m.id}: HTTP ${st} ${errMsg.slice(0, 120)}`); stopProvider = true; break;\n          }\n          if (st === 400 && useStrict && m.strict && /response_format|json_schema|schema|structured/i.test(errMsg)) {\n            p.noStrict.add(m.id); useStrict = false;\n            attempts.push(`${name}/${m.id}: json_schema unsupported (${errMsg.slice(0, 80)}) -> retrying with json_object`);\n            continue;  // second pass, same model, no strike\n          }\n          if (st < 200 || st >= 300 || rb.error) throw new Error(`HTTP ${st} ${errMsg}`.trim());\n          const content = contentOf(rb);\n          if (!content || !String(content).trim()) throw new Error(`empty content (finish_reason=${finishOf(rb) || '?'}${rb.choices && rb.choices[0] && rb.choices[0].message && rb.choices[0].message.reasoning ? ', reasoning only' : ''})`);\n          const clean = extractJson(content);\n          if (clean !== String(content)) rb.choices[0].message.content = clean;\n          result = { ...rb, provider: name, model_used: m.id, elapsed_ms: Date.now() - started };\n          p.used++;\n        } catch (e) {\n          const head = contentOf(rb) ? ` · content: ${String(contentOf(rb)).replace(/\\s+/g, ' ').slice(0, 60)}…` : '';\n          attempts.push(`${name}/${m.id}: ${String(e.message || e).replace(/\\s+/g, ' ').slice(0, 140)}${head}`);\n          strike(p, m.id, st === 404 || st === 400);\n          break;\n        } finally { await sleep(p.delay); }\n      }\n    }\n  }\n  out.push({ json: result ? { ...result, llm_attempts: attempts } : { error: { message: 'all providers failed: ' + attempts.join(' | ') }, llm_attempts: attempts }, pairedItem: { item: i } });\n}\nfor (const [name, p] of Object.entries(providers)) {\n  if (p.bench.size) notes.push(`${p.label} models benched this run: ${[...p.bench.entries()].map(([id, b]) => `${id} (${b.until === Infinity ? 'gone' : b.strikes + ' strike' + (b.strikes > 1 ? 's' : '')})`).join(', ')}`);\n  if (p.noStrict.size) notes.push(`${p.label} models without json_schema support (used json_object): ${[...p.noStrict].join(', ')}`);\n}\nconst failed = out.filter(o => o.json.error).length;\nnotes.push(`synthesis: openrouter ${providers.openrouter.used}, groq ${providers.groq.used}, lmstudio ${lmUsed}, failed ${failed}`);\nnotes.push(`synthesis time: ${Math.round((Date.now() - runStart) / 60000)} of ${Math.round(budgetMs / 60000)} min budget for ${clusters.length} stories${overShareStories ? `; ${overShareStories} provider hop(s) forced by the per-story share` : ''}${overBudgetStories ? `; ${overBudgetStories} stor${overBudgetStories === 1 ? 'y' : 'ies'} sent straight to LM Studio after the budget ran out` : ''}`);\nfor (const o of out) o.json.llm_notes = notes;\nreturn out;"
+      },
+      "id": "5cef7e95-3f59-5910-9e43-2867e03289e7",
+      "name": "Synthesize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        600
+      ],
+      "notes": "Per story: providers in cfg.provider_order (openrouter -> groq -> lmstudio), models ranked, cooldown breakers, json_schema->json_object retry. Never stops the run."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const c = $('Build Prompt').item.json;\n// Extract-from-File (JSON) wraps the parsed document under `data`.\nconst attackDoc = ($('ATTACK Map').first().json) || {};\nconst attack = attackDoc.techniques || (attackDoc.data && attackDoc.data.techniques) || {};\nif (!Object.keys(attack).length) throw new Error('ATT&CK technique map is empty — check /data/intel/data/attack-techniques.json');\nconst refang = s => String(s).replace(/\\[\\.\\]|\\(\\.\\)|\\{\\.\\}/g, '.').replace(/\\[:\\]/g, ':').replace(/\\[at\\]|\\(at\\)/gi, '@').replace(/^hxxp/i, 'http');\n\nlet llm = null, llm_error = null;\ntry {\n  const content = $json.choices && $json.choices[0] && $json.choices[0].message && $json.choices[0].message.content;\n  if (!content) throw new Error(($json.error && ($json.error.message || JSON.stringify($json.error))) || 'LLM returned no content');\n  const t = String(content).replace(/^\\s*```(?:json)?\\s*|\\s*```\\s*$/g, '').replace(/^\\s*\\{\\s*\\{/, '{').trim();  // \"{ {\" double-brace seen from nemotron\n  try { llm = JSON.parse(t); } catch (e1) { const a = t.indexOf('{'), z = t.lastIndexOf('}'); if (a >= 0 && z > a) llm = JSON.parse(t.slice(a, z + 1)); else throw e1; }\n  if (!llm || typeof llm !== 'object' || Array.isArray(llm)) throw new Error('LLM returned non-object JSON');\n  // Non-strict models invent their own key names (execution 16: title / att&ck_techniques / vulnerability_details / affected_systems).\n  const ALIAS = { headline: ['title', 'headline_text', 'story_title'], summary: ['brief', 'overview', 'description', 'consolidated_summary'],\n    category: ['type', 'story_type', 'classification'], key_facts: ['facts', 'key_points', 'highlights', 'details'],\n    affected_products: ['affected_systems', 'affected', 'products', 'affected_software'], cves: ['vulnerabilities', 'vulnerability_details', 'cve_list', 'cve', 'cve_ids'],\n    iocs: ['indicators', 'indicators_of_compromise', 'ioc', 'ioc_list'], ttps: ['att&ck_techniques', 'attack_techniques', 'techniques', 'mitre_attack', 'mitre_techniques', 'attack_types', 'tactics_techniques', 'mitre_attack_techniques'],\n    threat_actors: ['actors', 'adversaries', 'threat_actor', 'threat_groups'], malware: ['malware_families', 'tools', 'malware_names'],\n    recommended_actions: ['recommendations', 'mitigations', 'actions', 'remediation'], source_discrepancies: ['discrepancies', 'conflicts'], whats_new: ['new_information', 'updates', 'what_is_new'] };\n  const lowerKeys = {}; for (const k of Object.keys(llm)) lowerKeys[k.toLowerCase().replace(/[\\s-]+/g, '_')] = k;\n  for (const [k, alts] of Object.entries(ALIAS)) { if (llm[k] != null) continue; for (const a of alts) { const real = lowerKeys[a]; if (real && llm[real] != null) { llm[k] = llm[real]; break; } } }\n  // prompt-only models drift on case (\"Critical\", \"Vulnerability\")\n  if (typeof llm.severity === 'string') llm.severity = llm.severity.toLowerCase().trim();\n  if (typeof llm.category === 'string') llm.category = llm.category.toLowerCase().trim().replace(/\\s+/g, '-');\n} catch (e) { llm = null; llm_error = String(e.message || e); }\nif (!llm) {\n  // medium so the story renders in full (raw excerpts + regex IOCs) instead of collapsing into \"Also noted\"\n  llm = { headline: c.articles[0].title, category: 'other', severity: 'medium',\n    summary: '[LLM synthesis failed; raw excerpts] ' + c.articles.map(a => `${a.source}: ${String(a.text || '').slice(0, 400)}`).join(' | '),\n    key_facts: [], whats_new: '', affected_products: [], cves: [], iocs: [], ttps: [], threat_actors: [], malware: [], recommended_actions: [], source_discrepancies: [] };\n}\n\n// Non-strict models return fields in the wrong shape (object instead of array, bare string, null): coerce, never throw.\nconst arr = v => Array.isArray(v) ? v : (v == null || v === '' ? [] : (typeof v === 'object' ? Object.values(v) : [v]));\nconst DENY = [\"adobe.com\", \"amazon.com\", \"apache.org\", \"apple.com\", \"attack.mitre.org\", \"aws.amazon.com\", \"bleepingcomputer.com\", \"blog.qualys.com\", \"blog.talosintelligence.com\", \"blogs.cisco.com\", \"broadcom.com\", \"censys.io\", \"chrome.com\", \"cisa.gov\", \"cisco.com\", \"cisecurity.org\", \"citrix.com\", \"cloudflare.com\", \"crowdstrike.com\", \"cve.org\", \"cyberscoop.com\", \"darknet.org.uk\", \"darkreading.com\", \"docker.com\", \"elastic.co\", \"europol.europa.eu\", \"facebook.com\", \"fbi.gov\", \"first.org\", \"fortinet.com\", \"github.com\", \"gitlab.com\", \"google.com\", \"grahamcluley.com\", \"greynoise.io\", \"helpnetsecurity.com\", \"huntress.com\", \"infosecurity-magazine.com\", \"isc.sans.edu\", \"itsecurityguru.org\", \"ivanti.com\", \"kaspersky.com\", \"kb.cert.org\", \"krebsonsecurity.com\", \"kubernetes.io\", \"linkedin.com\", \"malwarebytes.com\", \"mandiant.com\", \"mcafee.com\", \"medium.com\", \"microsoft.com\", \"mitre.org\", \"mozilla.org\", \"ncsc.gov.uk\", \"netscout.com\", \"nist.gov\", \"npmjs.com\", \"nvd.nist.gov\", \"openssl.org\", \"oracle.com\", \"paloaltonetworks.com\", \"proofpoint.com\", \"pypi.org\", \"python.org\", \"rapid7.com\", \"recordedfuture.com\", \"reddit.com\", \"research.checkpoint.com\", \"sans.edu\", \"sans.org\", \"schneier.com\", \"security.googleblog.com\", \"securityaffairs.com\", \"securityweek.com\", \"sentinelone.com\", \"shodan.io\", \"sonicwall.com\", \"talosintelligence.com\", \"thehackernews.com\", \"therecord.media\", \"theregister.com\", \"troyhunt.com\", \"twitter.com\", \"unit42.paloaltonetworks.com\", \"virustotal.com\", \"vmware.com\", \"welivesecurity.com\", \"wikipedia.org\", \"wordfence.com\", \"wordpress.com\", \"wordpress.org\", \"x.com\", \"youtube.com\", \"zscaler.com\"];\nconst isDenied = d => { d = String(d || '').toLowerCase().replace(/^www\\./, ''); return !d || DENY.some(h => d === h || d.endsWith('.' + h)); };\nconst hostOf = v => ((String(v).match(/^[a-z][a-z0-9+.-]*:\\/\\/([^/?#:]+)/i) || [])[1] || '');\nconst isPrivateIp = v => { const p = v.split('.').map(Number); return p[0] === 10 || p[0] === 127 || p[0] === 0 || (p[0] === 192 && p[1] === 168) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 169 && p[1] === 254) || p[0] >= 224 || (p[0] === 100 && p[1] >= 64 && p[1] <= 127); };\nconst PLACEHOLDER = /example|placeholder|not present|hypothetical|illustrative|sample|dummy|redacted|\\bx{2,}\\b/i;\n// Any 2-letter ccTLD plus the gTLDs that actually show up in threat reporting; \"coder.cloudflare\" is not a domain.\nconst TLDS = new Set(('com net org info biz io co me us tv cc ws su to ly pw sh ai gg gl app dev cloud tech online site store shop ' +\n  'space top xyz icu club live link click one buzz cfd cyou monster quest rest sbs work zip mov bond lol autos wtf fun run pro ' +\n  'vip win bid loan men date review stream download racing party trade webcam accountant faith science cricket gdn kim country ' +\n  'life world today digital network systems solutions services agency email group center company ltd inc llc host press news ' +\n  'media blog wiki tools support help team zone city global asia africa london nyc paris tokyo mobi name tel jobs travel aero ' +\n  'coop museum int gov edu mil arpa onion bit').split(' '));\nconst validTld = v => { const t = v.split('.').pop().toLowerCase(); return t.length === 2 || TLDS.has(t); };\nconst V = {\n  ipv4: v => /^(\\d{1,3}\\.){3}\\d{1,3}$/.test(v) && v.split('.').every(n => +n <= 255) && !isPrivateIp(v),\n  ipv6: v => /^[0-9a-f:]{3,45}$/i.test(v) && v.includes(':'),\n  domain: v => /^(?=.{4,253}$)([a-z0-9_-]+\\.)+[a-z]{2,63}$/i.test(v) && validTld(v),\n  url: v => /^https?:\\/\\/\\S+$/i.test(v),\n  sha256: v => /^[a-f0-9]{64}$/i.test(v),\n  sha1: v => /^[a-f0-9]{40}$/i.test(v),\n  md5: v => /^[a-f0-9]{32}$/i.test(v),\n  email: v => /^[^\\s@]+@[^\\s@]+\\.[a-z]{2,}$/i.test(v),\n  filename: v => /^[\\w.\\-\\s()]{3,120}$/.test(v) && /\\.[a-z0-9]{1,5}$/i.test(v),\n};\nconst iocs = [];\nconst addIoc = (type, value, context, method) => {\n  if (!V[type]) return false;\n  let v = refang(value).trim();\n  if (['ipv4', 'ipv6', 'domain', 'sha256', 'sha1', 'md5', 'email'].includes(type)) v = v.toLowerCase();\n  if (!V[type](v)) return false;\n  if (method !== 'regex' && ((type === 'domain' && isDenied(v)) || (type === 'url' && isDenied(hostOf(v))))) return false;\n  if (method !== 'regex' && (PLACEHOLDER.test(context || '') || /example\\.(com|org|net)$/i.test(v))) return false;\n  if (iocs.some(i => i.value === v)) return false;\n  iocs.push({ type, value: v, context: context || '', method });\n  return true;\n};\nfor (const i of arr(c.iocs)) addIoc(i.type, i.value, '', 'regex');\nlet dropped_iocs = 0;\nfor (const i of arr(llm.iocs)) { if (!i || typeof i !== 'object') { dropped_iocs++; continue; } if (!addIoc(i.type || i.kind || i.ioc_type, i.value || i.indicator || i.ioc, i.context || i.description, 'llm')) dropped_iocs++; }\n\nconst cveMap = new Map();\nfor (const id of arr(c.cves)) cveMap.set(id, { id, context: '', exploited_in_wild: false, method: 'regex' });\nconst cveRaw = llm.cves;\nconst cveList = (cveRaw && typeof cveRaw === 'object' && !Array.isArray(cveRaw) && (cveRaw.id || cveRaw.cve_id || cveRaw.cve)) ? [cveRaw] : arr(cveRaw);\nfor (const v0 of cveList) {\n  const v = (v0 && typeof v0 === 'object') ? v0 : { id: v0 };\n  const id = String(v.id || v.cve_id || v.cve || '').toUpperCase().trim();\n  if (!/^CVE-\\d{4}-\\d{4,7}$/.test(id)) continue;\n  const cur = cveMap.get(id) || { id, method: 'llm' };\n  cveMap.set(id, { ...cur, context: String(v.context || cur.context || ''), exploited_in_wild: !!v.exploited_in_wild || !!cur.exploited_in_wild });\n}\n\n// --- ATT&CK. Small models know technique NAMES far better than IDs (run 3: \"T1547.001 Registry Run Keys\" labelled\n// \"Data from Local System\"), so resolve by name and only trust a model-supplied id when the table's name agrees.\nconst STOPW = new Set(['of', 'a', 'an', 'the', 'and', 'or', 'for', 'via', 'to', 'in', 'on', 'by', 'with', 'from', 'as']);\nconst stem = w => w.replace(/(ations?|ation|ing|ed|es|s)$/, '');\nconst toks = s => new Set(String(s || '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\\s+/).filter(w => w && !STOPW.has(w)).map(stem));\nconst norm = s => [...toks(s)].join(' ');\nconst nameIndex = new Map(); const fuzzyIndex = [];\nfor (const [id, t] of Object.entries(attack)) {\n  if (t.deprecated) continue;\n  const parent = id.includes('.') ? attack[id.split('.')[0]] : null;\n  const names = [t.name]; if (parent) names.push(parent.name + ' ' + t.name);\n  for (const nm of names) { const k = norm(nm); if (k && !nameIndex.has(k)) nameIndex.set(k, id); fuzzyIndex.push({ id, tk: toks(nm) }); }\n}\nconst resolveByName = name => {\n  const raw = String(name || ''); if (!raw.trim()) return null;\n  const candidates = [raw, raw.split('(')[0], ...raw.split(/[:(]/)].map(norm).filter(Boolean);\n  for (const k of candidates) if (nameIndex.has(k)) return nameIndex.get(k);\n  // fuzzy: the smaller stemmed token set must be (almost) contained in the other, and have >= 2 tokens\n  const q = toks(raw.split('(')[0]); if (q.size < 2) return null;\n  let best = null, bestScore = 0;\n  for (const e of fuzzyIndex) {\n    const small = q.size <= e.tk.size ? q : e.tk, large = small === q ? e.tk : q;\n    let hit = 0; for (const w of small) if (large.has(w)) hit++;\n    const score = hit / small.size - Math.abs(q.size - e.tk.size) * 0.05;\n    if (hit >= 2 && hit / small.size >= 0.75 && score > bestScore) { best = e.id; bestScore = score; }\n  }\n  return best;\n};\nconst ttps = [], dropped_ttps = [];\nconst pushTtp = (id, behaviour, method) => {\n  const t = attack[id]; if (!t) { dropped_ttps.push(id); return; }\n  const ex = ttps.find(x => x.attack_id === id);\n  if (ex) { if (behaviour && !ex.behaviour) ex.behaviour = behaviour; if (method === 'explicit') ex.method = 'explicit'; return; }\n  ttps.push({ attack_id: id, name: t.name, tactics: t.tactics || [], url: t.url, stix_id: t.stix_id, deprecated: !!t.deprecated, behaviour: behaviour || '', method });\n};\nfor (const id of arr(c.tids)) pushTtp(id, '', 'explicit');\nfor (const t0 of arr(llm.ttps)) {\n  const t = (t0 && typeof t0 === 'object') ? { technique_name: t0.technique_name || t0.technique || t0.name || t0.title || '', attack_id: t0.attack_id || t0.id || t0.technique_id || t0.mitre_id || '', behaviour: t0.behaviour || t0.behavior || t0.evidence || t0.description || '' } : { technique_name: String(t0 || ''), attack_id: String(t0 || '') };\n  const idm = String(t.attack_id || '').toUpperCase().replace(/\\s+/g, '').match(/T\\d{4}(?:\\.\\d{3})?/);\n  const idHit = idm && attack[idm[0]] ? idm[0] : null;\n  const byName = resolveByName(t.technique_name);\n  const idNameAgrees = idHit && (norm(attack[idHit].name) === norm(t.technique_name) || resolveByName(attack[idHit].name) === byName);\n  const chosen = byName || (idNameAgrees ? idHit : null);\n  if (chosen) pushTtp(chosen, t.behaviour, 'inferred');\n  else dropped_ttps.push(`${idHit || t.attack_id || '?'} \"${String(t.technique_name || '').slice(0, 60)}\"`);\n}\n\nconst clean = v => [...new Set(arr(v).map(s => (s && typeof s === 'object') ? String(s.name || s.value || s.text || JSON.stringify(s)) : String(s)).map(s => s.trim()).filter(s => s && s !== '[object Object]'))];\n// Small models pad these fields with meta-commentary; strip anything that is not a real value.\nconst NOT_AN_ACTOR = /^(unknown|unidentified|unnamed|n\\/a|none|not (specified|provided|mentioned|identified)|various|multiple|attackers?|hackers?|threat actors?|cybercriminals?|criminals?|adversar(y|ies)|operators?|researchers?|frontier ai|autonomous|ai agents?|state[- ]sponsored|nation[- ]state)\\b|research(er| team| group| lab)|security team|red team|vendor|drone|openai|anonymous|^(russia|china|iran|north korea|dprk|ukraine|israel|united states|usa|us|uk|europe|microsoft|google|amazon|meta|apple|cisa|fbi|nsa)$|^(chinese|russian|iranian|north korean|ukrainian|american|china[- ]nexus|russia[- ]nexus|iran[- ]nexus|[a-z]+-(nexus|aligned|linked|backed))\\b.*\\b(actors?|gangs?|hackers?|groups?|attackers?|apt)$|\\bgangs$/i;\nconst NOISE = /^(n\\/a|none|not applicable|no (new|specific|direct|actionable|additional)\\b|nothing new|the sources? (provide|do not)|no (factual )?(contradictions|discrepancies))/i;\nconst actors = clean(llm.threat_actors).filter(a => !NOT_AN_ACTOR.test(a) && a.length <= 60);\nconst malware = clean(llm.malware).filter(m => !/^(unknown|none|n\\/a|custom (backdoor|malware|payload)|malware|payloads?|ransomware)$/i.test(m) && m.length <= 60);\nlet whats_new = String(llm.whats_new || '').trim();\nif (!c.is_update || NOISE.test(whats_new)) whats_new = '';\nlet headline = String((llm.headline && typeof llm.headline === 'object') ? (llm.headline.text || llm.headline.title || '') : (llm.headline || '')).trim();\nif (typeof llm.summary !== 'string') llm.summary = clean(llm.summary).join(' ');\nif (typeof llm.whats_new !== 'string') llm.whats_new = clean(llm.whats_new).join(' ');\nif (!headline || /no actionable|not (contain|provide|include)|(daily|consolidated) threat brief|no (threat )?intel/i.test(headline)) headline = c.articles[0].title;\nconst SEV = ['critical', 'high', 'medium', 'low', 'info'];\nlet severity = SEV.includes(llm.severity) ? llm.severity : 'medium';\n// Think-pieces, policy and tooling posts are never \"high\" for an engineer's queue; real exploitation needs evidence.\nconst category = String(llm.category || 'other');\nif (['research', 'policy', 'tooling', 'other'].includes(category) && SEV.indexOf(severity) < SEV.indexOf('medium')) severity = 'medium';\nconst hasEvidence = cveMap.size > 0 || iocs.length > 0 || actors.length > 0 || malware.length > 0 || ['breach', 'ransomware', 'exploitation', 'apt', 'supply-chain'].includes(category);\nif (severity === 'critical' && !hasEvidence) severity = 'high';\n// A vulnerability story with no sign of exploitation (no exploited CVE, IOCs, actors or malware) is a patch note, not an incident.\nconst exploitationSignal = [...cveMap.values()].some(v => v.exploited_in_wild) || iocs.length > 0 || actors.length > 0 || malware.length > 0;\nif (category === 'vulnerability' && !exploitationSignal && SEV.indexOf(severity) < SEV.indexOf('medium')) severity = 'medium';\nconst brief = { ...llm, headline, category, severity, whats_new,\n  cves: [...cveMap.values()], iocs, ttps,\n  threat_actors: actors, malware, affected_products: clean(llm.affected_products).filter(p => !/^(n\\/a|none|unknown)$/i.test(p)),\n  key_facts: clean(llm.key_facts).filter(f => !NOISE.test(f)), recommended_actions: clean(llm.recommended_actions).filter(f => !NOISE.test(f)),\n  source_discrepancies: c.articles.length > 1 ? clean(llm.source_discrepancies).filter(f => !NOISE.test(f)) : [],\n};\nconst { request_body, ...rest } = c;\nreturn { json: { ...rest, brief, llm_error, dropped_ttps, dropped_iocs, llm_usage: $json.usage || null,\n  llm_provider: $json.provider || null, llm_model: $json.model_used || null, llm_attempts: $json.llm_attempts || [], llm_notes: $json.llm_notes || [] } };"
+      },
+      "id": "13259d92-c630-5d3f-8020-b4c9dc54d7cc",
+      "name": "Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        600
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Shapes are coerced so this should never throw; if it does, the story is dropped and counted in Run notes instead of killing the run."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Unique IOCs across all stories -> one item each with the VirusTotal / OTX lookup paths, ordered by story severity.\n// IOC-free days emit a single sentinel so the IF's false branch keeps the pipeline flowing.\nconst cfg = $('Config').first().json;\nconst stories = $input.all().map(i => i.json).filter(s => s && s.brief);\nconst b64url = s => {\n  let b; try { b = Buffer.from(String(s), 'utf8').toString('base64'); } catch (e) { b = btoa(unescape(encodeURIComponent(String(s)))); }\n  return b.replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n};\nconst SEV = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };\nconst seen = new Map();\nfor (const s of stories) {\n  const sev = SEV[(s.brief || {}).severity] == null ? 5 : SEV[s.brief.severity];\n  for (const i of ((s.brief && s.brief.iocs) || [])) {\n    const key = i.type + ':' + i.value;\n    const cur = seen.get(key);\n    if (cur) { cur.clusters.push(s.cluster_id); cur.sev = Math.min(cur.sev, sev); continue; }\n    let vt = null, otx = null;\n    switch (i.type) {\n      case 'ipv4': vt = 'ip_addresses/' + i.value; otx = 'IPv4/' + i.value + '/general'; break;\n      case 'ipv6': vt = 'ip_addresses/' + i.value; otx = 'IPv6/' + i.value + '/general'; break;\n      case 'domain': vt = 'domains/' + i.value; otx = (i.value.split('.').length >= 3 ? 'hostname/' : 'domain/') + i.value + '/general'; break;\n      case 'url': vt = 'urls/' + b64url(i.value); otx = 'url/' + encodeURIComponent(i.value) + '/general'; break;\n      case 'sha256': case 'sha1': case 'md5': vt = 'files/' + i.value; otx = 'file/' + i.value + '/general'; break;\n      default: break;  // email / filename: nothing to look up\n    }\n    if (!vt) continue;\n    seen.set(key, { is_ioc: true, type: i.type, value: i.value, vt_path: vt, otx_path: otx, clusters: [s.cluster_id], sev });\n  }\n}\nconst list = [...seen.values()].sort((a, b) => a.sev - b.sev).slice(0, cfg.max_iocs_to_enrich);\nif (!list.length) return [{ json: { is_ioc: false, none: true } }];\nreturn list.map(x => ({ json: x }));"
+      },
+      "id": "ddf8981c-2ce3-5894-a49f-5fa360d96341",
+      "name": "Collect IOCs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "ioc",
+              "leftValue": "={{ $json.is_ioc }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "efc0ef1c-01af-5df3-908f-d68221670cad",
+      "name": "Has IOCs?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        220,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.virustotal.com/api/v3/{{ $json.vt_path }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 15500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "virusTotalApi"
+      },
+      "id": "f1b88899-06b8-5155-9604-2390c947bf82",
+      "name": "VirusTotal Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        740
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Public API pacing: 4 lookups/min, 500/day.",
+      "credentials": {
+        "virusTotalApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "VirusTotal account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://otx.alienvault.com/api/v1/indicators/{{ $('Collect IOCs').item.json.otx_path }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1200
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "alienVaultApi"
+      },
+      "id": "8e937631-c777-560d-9768-b0b265f62d54",
+      "name": "OTX Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        740
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 4000,
+      "notes": "OTX is slow/flaky on some indicator types; retries + 60 s timeout. Failures degrade to 'unverified', never stop the run.",
+      "credentials": {
+        "alienVaultApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "AlienVault account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Pair the VirusTotal and OTX responses back to the IOC list (HTTP Request emits exactly one item per input, in order)\n// and derive a verdict + STIX confidence. Never throws: unknown/failed lookups become 'unverified'.\nconst iocs = $('Collect IOCs').all().map(i => i.json);\nconst vt = $('VirusTotal Lookup').all().map(i => i.json);\nconst otx = $input.all().map(i => i.json);\nconst out = {};\nconst stats = { looked_up: iocs.length, vt_found: 0, vt_not_found: 0, vt_rate_limited: 0, vt_errors: 0, otx_found: 0, otx_not_found: 0, otx_errors: 0, malicious: 0, suspicious: 0, clean: 0, unverified: 0 };\nconst bodyOf = r => (r && r.body !== undefined ? r.body : r) || {};\nconst statusOf = r => Number((r && r.statusCode) || 0);\nconst uniq = arr => [...new Set(arr.filter(Boolean))];\nconst GUI = { ipv4: 'ip-address', ipv6: 'ip-address', domain: 'domain', url: 'url', sha256: 'file', sha1: 'file', md5: 'file' };\nfor (let k = 0; k < iocs.length; k++) {\n  const ioc = iocs[k], v = vt[k] || {}, o = otx[k] || {};\n  const rec = { type: ioc.type, value: ioc.value, clusters: ioc.clusters, vt: { found: false }, otx: { found: false }, verdict: 'unverified', confidence: 30 };\n  const vs = statusOf(v), vb = bodyOf(v);\n  if (vs === 200 && vb.data && vb.data.attributes) {\n    const a = vb.data.attributes, st = a.last_analysis_stats || {};\n    rec.vt = { found: true, malicious: st.malicious || 0, suspicious: st.suspicious || 0, harmless: st.harmless || 0, undetected: st.undetected || 0,\n      total: Object.values(st).reduce((x, y) => x + (Number(y) || 0), 0), reputation: a.reputation,\n      last_analysis: a.last_analysis_date ? new Date(a.last_analysis_date * 1000).toISOString() : null,\n      threat_label: (a.popular_threat_classification && a.popular_threat_classification.suggested_threat_label) || null,\n      name: a.meaningful_name || null, id: vb.data.id, gui: `https://www.virustotal.com/gui/${GUI[ioc.type]}/${vb.data.id}` };\n    stats.vt_found++;\n  } else if (vs === 404) { stats.vt_not_found++; }\n  else if (vs === 429) { rec.vt.error = 'rate limited'; stats.vt_rate_limited++; }\n  else { rec.vt.error = 'HTTP ' + vs + (vb.error && vb.error.message ? ' ' + String(vb.error.message).slice(0, 80) : ''); stats.vt_errors++; }\n  const os = statusOf(o), ob = bodyOf(o);\n  if (os === 200 && ob && (ob.pulse_info || ob.indicator)) {\n    const pi = ob.pulse_info || {}, pulses = (pi.pulses || []).slice(0, 5);\n    const kind = String(ioc.otx_path).split('/')[0].toLowerCase().replace(/^ipv[46]$/, 'ip');\n    rec.otx = { found: true, pulse_count: pi.count || 0, pulses: pulses.map(p => p.name).filter(Boolean).slice(0, 3),\n      tags: uniq(pulses.flatMap(p => p.tags || [])).slice(0, 8),\n      malware_families: uniq(pulses.flatMap(p => (p.malware_families || []).map(m => (m && (m.display_name || m.name)) || m))).slice(0, 5),\n      adversaries: uniq(pulses.map(p => p.adversary)).slice(0, 3),\n      whitelisted: Array.isArray(ob.validation) && ob.validation.some(x => /whitelist|false.?positive|akamai|cloudflare|alexa|majestic|top.?1m/i.test(((x && x.source) || '') + ' ' + ((x && x.name) || ''))),\n      url: `https://otx.alienvault.com/indicator/${kind}/${encodeURIComponent(ioc.value)}` };\n    stats.otx_found++;\n  } else if (os === 404 || os === 400) { stats.otx_not_found++; }\n  else if (os === 429) { rec.otx.error = 'rate limited'; stats.otx_errors++; }\n  else if (!os) { rec.otx.error = 'request failed' + (o && o.error ? ': ' + String((o.error && o.error.message) || o.error).replace(/\\s+/g, ' ').slice(0, 60) : ''); stats.otx_errors++; }\n  else { rec.otx.error = 'HTTP ' + os; stats.otx_errors++; }\n  if (rec.otx.found) rec.otx.adversaries = rec.otx.adversaries.filter(a => !/unknown|unattributed|n\\/a/i.test(a));\n  const m = rec.vt.malicious || 0, sp = rec.vt.suspicious || 0, pc = rec.otx.pulse_count || 0;\n  // Pulses alone are weak evidence (honeypot feeds, community pulses): with VT silent, require 10+ before \"malicious\".\n  if (rec.otx.whitelisted && m === 0) { rec.verdict = 'clean'; rec.confidence = 10; }\n  else if (m >= 3 || (pc >= 2 && m >= 1) || (m === 0 && pc >= 10)) { rec.verdict = 'malicious'; rec.confidence = 85; }\n  else if (m >= 1 || sp >= 1 || pc >= 1) { rec.verdict = 'suspicious'; rec.confidence = 60; }\n  else if (rec.vt.found && ((rec.vt.harmless || 0) + (rec.vt.undetected || 0)) > 0) { rec.verdict = 'clean'; rec.confidence = 15; }\n  else { rec.verdict = 'unverified'; rec.confidence = 30; }\n  stats[rec.verdict]++;\n  out[ioc.value] = rec;\n}\nreturn [{ json: { iocs: out, stats } }];"
+      },
+      "id": "d9507a01-50ad-5ead-a9f1-11659dc3b582",
+      "name": "Aggregate IOC Intel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        740
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "8438d515-5ebc-5787-9341-a06e1f3f8bfa",
+      "name": "Merge IOC Intel",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        880,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Single item in (from the last Validate item), single item out: { enriched: {CVE: {...}}, notes }.\nconst cfg = $('Config').first().json;\nconst clusters = $('Validate').all().map(i => i.json).filter(c => c && c.brief);\nconst cves = [...new Set(clusters.flatMap(c => (c.brief.cves || []).map(v => v.id)))].slice(0, cfg.max_cves_to_enrich);\nconst notes = [], enriched = {};\nconst http = (this.helpers && typeof this.helpers.httpRequest === 'function') ? (o => this.helpers.httpRequest(o)) : null;\nconst sleep = ms => new Promise(r => setTimeout(r, ms));\nconst set = (id, patch) => { enriched[id] = Object.assign(enriched[id] || {}, patch); };\nif (!http) notes.push('this.helpers.httpRequest unavailable in this runtime; CVE enrichment skipped');\nif (http && cves.length) {\n  try {\n    const kev = await http({ method: 'GET', url: 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json', json: true, timeout: 60000 });\n    const map = new Map((kev.vulnerabilities || []).map(v => [v.cveID, v]));\n    for (const id of cves) { const k = map.get(id); if (k) set(id, { kev: true, kev_date_added: k.dateAdded, kev_due: k.dueDate, kev_ransomware: k.knownRansomwareCampaignUse, kev_action: k.requiredAction, vendor: k.vendorProject, product: k.product, kev_name: k.vulnerabilityName }); }\n  } catch (e) { notes.push('KEV fetch failed: ' + e.message); }\n  for (let i = 0; i < cves.length; i += 30) {\n    const chunk = cves.slice(i, i + 30);\n    try {\n      const r = await http({ method: 'GET', url: 'https://api.first.org/data/v1/epss?cve=' + chunk.join(','), json: true, timeout: 60000 });\n      for (const d of (r.data || [])) set(d.cve, { epss: +d.epss, epss_percentile: +d.percentile });\n    } catch (e) { notes.push('EPSS fetch failed: ' + e.message); }\n  }\n  for (let i = 0; i < cves.length; i++) {\n    const id = cves[i];\n    try {\n      const r = await http({ method: 'GET', url: 'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=' + id, json: true, timeout: 60000 });\n      const v = r && r.vulnerabilities && r.vulnerabilities[0] && r.vulnerabilities[0].cve;\n      if (v) {\n        const mx = v.metrics || {};\n        const m = (mx.cvssMetricV40 || mx.cvssMetricV31 || mx.cvssMetricV30 || mx.cvssMetricV2 || [])[0];\n        const cd = m && m.cvssData;\n        const desc = (v.descriptions || []).find(d => d.lang === 'en');\n        const cwe = (v.weaknesses || []).flatMap(w => w.description || []).map(d => d.value).find(x => /^CWE-\\d+$/.test(x));\n        set(id, { nvd_published: v.published, nvd_status: v.vulnStatus, description: desc && desc.value, cvss: cd && cd.baseScore, cvss_severity: (cd && cd.baseSeverity) || (m && m.baseSeverity), cvss_vector: cd && cd.vectorString, cwe, kev: (enriched[id] && enriched[id].kev) || !!v.cisaExploitAdd });\n      }\n    } catch (e) { notes.push('NVD ' + id + ': ' + e.message); }\n    if (i < cves.length - 1) await sleep(6500);  // 5 requests / 30 s public limit\n  }\n}\nreturn [{ json: { run_date: cfg.run_date, enriched, cve_count: cves.length, notes } }];"
+      },
+      "id": "9b453788-f936-52e6-a1c2-4671fc3417ad",
+      "name": "Enrich CVEs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1200
+      ],
+      "notes": "KEV + EPSS + NVD via this.helpers.httpRequest. NVD is throttled to 1 req / 6.5 s; needs N8N_RUNNERS_TASK_TIMEOUT raised."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "let __crypto = null; try { __crypto = require('crypto'); } catch (e) { __crypto = null; }\nfunction uuidFrom(str) {\n  let hex;\n  if (__crypto) { hex = __crypto.createHash('sha256').update(String(str)).digest('hex').slice(0, 32); }\n  else {\n    hex = '';\n    for (let s = 0; s < 4; s++) {\n      let h = (0x811c9dc5 ^ (s * 0x9e3779b1)) >>> 0;\n      for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }\n      hex += h.toString(16).padStart(8, '0');\n    }\n  }\n  hex = hex.slice(0, 12) + '5' + hex.slice(13, 16) + ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16) + hex.slice(17, 32);\n  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;\n}\n\n// MISP is the ledger for developing stories. Per story: reuse the MISP event reached through the prior-story chain\n// (Qdrant payload -> Cluster prior hits), else look up / create an event with a deterministic uuid (idempotent on\n// re-runs); push CVEs, sources, ATT&CK tags and every extracted IOC (verdict as tag, to_ids only for malicious /\n// suspicious); publish; read the event back so the digest can show the cumulative indicator set. Guardrails: only\n// regex-extracted or validated indicators ever reach MISP (the model never adds), nothing is deleted, and any failure\n// degrades to \"not synced\" in the run notes — the digest ships regardless.\nconst cfg = $('Config').first().json;\nconst enr = $json || {};\nconst passthrough = { run_date: enr.run_date, enriched: enr.enriched || {}, cve_count: enr.cve_count, notes: [...(enr.notes || [])] };\nconst clusters = $('Validate').all().map(i => i.json).filter(c => c && c.brief);\nlet iocIntel = {}; try { iocIntel = $('Aggregate IOC Intel').first().json.iocs || {}; } catch (e) {}\nlet apiKey = '', mispUrl = cfg.misp_url; try { apiKey = String($env.MISP_API_KEY || '').trim(); if ($env.MISP_URL) mispUrl = String($env.MISP_URL).replace(/\\/$/, ''); } catch (e) {}\nconst http = (this.helpers && typeof this.helpers.httpRequest === 'function') ? (o => this.helpers.httpRequest(o)) : null;\nconst misp = { enabled: !!(apiKey && http), url: mispUrl, stories: {}, stats: { created: 0, updated: 0, attributes_added: 0, duplicates: 0, failed: 0, cumulative_read: 0 }, errors: [] };\nif (!misp.enabled) { passthrough.notes.push(apiKey ? 'MISP: httpRequest unavailable in this runtime; not synced' : 'MISP: no API key configured (MISP_API_KEY); stories not synced'); return [{ json: { ...passthrough, misp } }]; }\nconst H = { Authorization: apiKey, Accept: 'application/json', 'Content-Type': 'application/json' };\nconst call = async (method, path, body) => { const r = await http({ method, url: mispUrl + path, headers: H, body, json: true, timeout: 60000, returnFullResponse: true, ignoreHttpStatusErrors: true }); return { status: Number(r && r.statusCode) || 0, body: (r && r.body && typeof r.body === 'object') ? r.body : {} }; };\nconst ATTR_TYPE = { ipv4: 'ip-dst', ipv6: 'ip-dst', domain: 'domain', url: 'url', sha256: 'sha256', sha1: 'sha1', md5: 'md5', email: 'email-src', filename: 'filename' };\nconst ATTR_CAT = { ipv4: 'Network activity', ipv6: 'Network activity', domain: 'Network activity', url: 'Network activity', sha256: 'Payload delivery', sha1: 'Payload delivery', md5: 'Payload delivery', email: 'Payload delivery', filename: 'Payload delivery' };\nconst THREAT = { critical: 1, high: 1, medium: 2, low: 3, info: 4 };\nconst toIds = new Set(cfg.misp_to_ids_verdicts || ['malicious', 'suspicious']);\nconst verdictOf = v => (iocIntel[v] || {}).verdict || 'unverified';\nconst iocComment = v => { const r = iocIntel[v]; if (!r) return 'not looked up'; const p = [r.verdict.toUpperCase()]; if (r.vt.found) p.push(`VT ${r.vt.malicious}/${r.vt.total}${r.vt.threat_label ? ' ' + r.vt.threat_label : ''}`); if (r.otx.found) p.push(`OTX ${r.otx.pulse_count} pulses${r.otx.adversaries.length ? ' (' + r.otx.adversaries.join(', ') + ')' : ''}`); return p.join(' · '); };\nconst enriched = passthrough.enriched;\nconst cveComment = id => { const x = enriched[id] || {}; const p = []; if (x.cvss != null) p.push(`CVSS ${x.cvss}${x.cvss_severity ? ' ' + x.cvss_severity : ''}`); if (x.kev) p.push('CISA KEV'); if (x.epss != null) p.push(`EPSS ${(x.epss * 100).toFixed(1)}%`); if (x.vendor || x.product) p.push([x.vendor, x.product].filter(Boolean).join(' / ')); return p.join(' · '); };\n// Tags are created up front (idempotent: \"already exists\" is fine) so attribute/event tagging never fails on a missing tag.\nconst tagNames = new Set(cfg.misp_tags || []); for (const v of ['malicious', 'suspicious', 'clean', 'unverified']) tagNames.add(`cyberintel:verdict=\"${v}\"`);\nfor (const t of tagNames) { try { await call('POST', '/tags/add', { Tag: { name: t, colour: t.startsWith('tlp:') ? '#ffffff' : (t.includes('malicious') ? '#e01e5a' : (t.includes('suspicious') ? '#f2a100' : '#3b82f6')), exportable: true } }); } catch (e) {} }\nconst attrsFor = (s, sinceMisp) => {\n  const b = s.brief, out = [];\n  for (const v of b.cves) out.push({ type: 'vulnerability', category: 'External analysis', value: v.id, to_ids: false, comment: [cveComment(v.id), v.context].filter(Boolean).join(' — ').slice(0, 250), distribution: 5 });\n  for (const i of b.iocs) { if (!ATTR_TYPE[i.type]) continue; const vd = verdictOf(i.value); out.push({ type: ATTR_TYPE[i.type], category: ATTR_CAT[i.type], value: i.value, to_ids: toIds.has(vd), comment: [iocComment(i.value), i.context].filter(Boolean).join(' — ').slice(0, 250), distribution: 5, Tag: [{ name: `cyberintel:verdict=\"${vd}\"` }] }); }\n  for (const a of s.articles) out.push({ type: 'link', category: 'External analysis', value: a.url, to_ids: false, comment: `${a.source}: ${String(a.title).slice(0, 200)} (${cfg.run_date})`, distribution: 5 });\n  return out;\n};\nconst eventTags = s => [...(cfg.misp_tags || []).map(name => ({ name })), ...s.brief.ttps.slice(0, 12).map(t => ({ name: `misp-galaxy:mitre-attack-pattern=\"${t.name} - ${t.attack_id}\"` }))];\nfor (const s of clusters) {\n  const rec = { event_id: null, event_uuid: null, event_url: null, action: 'none', added: 0, duplicates: 0, cumulative: [], errors: [] };\n  misp.stories[s.cluster_id] = rec;\n  try {\n    // 1. which event? prior chain first, then the deterministic uuid for this cluster (same-day re-run safe)\n    const priorWithEvent = (s.prior || []).find(p => p.misp_event_id);\n    let eventId = priorWithEvent ? priorWithEvent.misp_event_id : null;\n    const uuid = uuidFrom('misp-event:' + s.cluster_id);\n    if (!eventId) { const v = await call('GET', '/events/view/' + uuid); if (v.status === 200 && v.body.Event && v.body.Event.id) eventId = v.body.Event.id; }\n    const attrs = attrsFor(s);\n    if (!eventId) {\n      const ev = { Event: { uuid, info: String(s.brief.headline).slice(0, 250), date: cfg.run_date, distribution: cfg.misp_distribution, threat_level_id: THREAT[s.brief.severity] || 4, analysis: 2, published: false, Tag: eventTags(s), Attribute: attrs } };\n      const c = await call('POST', '/events/add', ev);\n      if (c.status >= 200 && c.status < 300 && c.body.Event && c.body.Event.id) { eventId = c.body.Event.id; rec.action = 'created'; rec.added = (c.body.Event.Attribute || []).length; misp.stats.created++; misp.stats.attributes_added += rec.added; }\n      else throw new Error(`create HTTP ${c.status} ${JSON.stringify(c.body.errors || c.body.message || '').slice(0, 160)}`);\n    } else {\n      rec.action = 'updated'; misp.stats.updated++;\n      for (const a of attrs) { const r = await call('POST', `/attributes/add/${eventId}`, { Attribute: a });\n        if (r.status >= 200 && r.status < 300) { rec.added++; misp.stats.attributes_added++;\n          // MISP 2.5 applies the inline Tag on /attributes/add but does not echo it in the response (verified 2026-09-12);\n          // the explicit addTag is belt-and-braces and answers \"Tag could not be added\" when it is already there.\n          const newId = r.body.Attribute && r.body.Attribute.id; const hasTag = r.body.Attribute && Array.isArray(r.body.Attribute.Tag) && r.body.Attribute.Tag.length;\n          if (newId && a.Tag && a.Tag.length && !hasTag) for (const t of a.Tag) { try { await call('POST', `/attributes/addTag/${newId}`, { tag: t.name }); } catch (e) {} } }\n        else if (r.status === 403 || /already exists|similar attribute/i.test(JSON.stringify(r.body))) { rec.duplicates++; misp.stats.duplicates++; }\n        else rec.errors.push(`attribute ${a.type} ${String(a.value).slice(0, 40)}: HTTP ${r.status}`); }\n      for (const t of eventTags(s)) { try { await call('POST', `/events/addTag/${eventId}`, { tag: t.name }); } catch (e) {} }\n    }\n    // 2. publish (edits unpublish) and read back the cumulative attribute set\n    try { await call('POST', `/events/publish/${eventId}`); } catch (e) { rec.errors.push('publish: ' + e.message); }\n    const v = await call('GET', `/events/view/${eventId}`);\n    if (v.status === 200 && v.body.Event) {\n      const E = v.body.Event; rec.event_id = String(E.id); rec.event_uuid = E.uuid; rec.event_url = `${mispUrl}/events/view/${E.id}`; misp.stats.cumulative_read++;\n      const todayVals = new Set(s.brief.iocs.map(i => i.value));\n      rec.cumulative = (E.Attribute || []).filter(a => !['link', 'vulnerability', 'comment', 'text'].includes(a.type)).map(a => ({ type: a.type, value: a.value, to_ids: !!(a.to_ids === true || a.to_ids === '1' || a.to_ids === 1), comment: a.comment || '', tags: (a.Tag || []).map(t => t.name), first_seen: new Date(Number(a.timestamp) * 1000).toISOString().slice(0, 10), added_today: todayVals.has(a.value) }));\n      rec.cves = (E.Attribute || []).filter(a => a.type === 'vulnerability').map(a => a.value);\n      rec.sources = (E.Attribute || []).filter(a => a.type === 'link').length;\n    } else { rec.event_id = String(eventId); rec.event_url = `${mispUrl}/events/view/${eventId}`; rec.errors.push(`read-back HTTP ${v.status}`); }\n  } catch (e) { rec.action = 'failed'; rec.errors.push(String(e.message || e).slice(0, 160)); misp.stats.failed++; }\n}\nif (misp.stats.failed) misp.errors = Object.entries(misp.stories).filter(([, r]) => r.action === 'failed').slice(0, 5).map(([k, r]) => `${k}: ${r.errors.join('; ')}`);\npassthrough.notes.push(`MISP (${mispUrl}): ${misp.stats.created} event(s) created, ${misp.stats.updated} updated, ${misp.stats.attributes_added} attribute(s) added, ${misp.stats.duplicates} already known${misp.stats.failed ? `, ${misp.stats.failed} stor${misp.stats.failed === 1 ? 'y' : 'ies'} not synced (${misp.errors.join(' | ').slice(0, 200)})` : ''}`);\nreturn [{ json: { ...passthrough, misp } }];"
+      },
+      "id": "b265ba63-74ba-56a2-97cb-fa2e91fd420a",
+      "name": "MISP Sync",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        1050
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Story ledger in MISP: reuse the event from the prior-story chain or create one (deterministic uuid); push CVEs, sources, ATT&CK tags, IOCs (verdict tags, to_ids for malicious/suspicious); publish; read back the cumulative set. Skipped without MISP_API_KEY."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "let __crypto = null; try { __crypto = require('crypto'); } catch (e) { __crypto = null; }\nfunction uuidFrom(str) {\n  let hex;\n  if (__crypto) { hex = __crypto.createHash('sha256').update(String(str)).digest('hex').slice(0, 32); }\n  else {\n    hex = '';\n    for (let s = 0; s < 4; s++) {\n      let h = (0x811c9dc5 ^ (s * 0x9e3779b1)) >>> 0;\n      for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }\n      hex += h.toString(16).padStart(8, '0');\n    }\n  }\n  hex = hex.slice(0, 12) + '5' + hex.slice(13, 16) + ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16) + hex.slice(17, 32);\n  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;\n}\n\nconst cfg = $('Config').first().json;\nconst enr = $json || {};\nconst mispAll = (enr.misp && enr.misp.stories) || {};\nconst mispOf = s => { const m = mispAll[s.cluster_id]; return (m && m.event_id) ? m : null; };\nconst enriched = enr.enriched || {};\nconst notes = [...(enr.notes || [])];\nconst validated = $('Validate').all().map(i => i.json);\nconst clusters = validated.filter(c => c && c.brief);\nconst brokenStories = validated.length - clusters.length;\nif (brokenStories) notes.push(`${brokenStories} stor${brokenStories === 1 ? 'y' : 'ies'} dropped: Validate threw (see the execution log in n8n)`);\ntry { const rr = $('Cluster').first().json.rerank; if (rr) notes.push((rr.enabled ? `reranker (${cfg.reranker_model}): judged ${rr.asked} borderline pair(s) → ${rr.merged} merged, ${rr.rejected} kept apart; prior-story links ${rr.prior_confirmed} confirmed / ${rr.prior_rejected} rejected` : 'reranker disabled (thresholds only)') + `${rr.prior_rejected_cve ? `; ${rr.prior_rejected_cve} prior link(s) vetoed by conflicting CVEs` : ''}${rr.prior_rejected_uncorroborated ? `; ${rr.prior_rejected_uncorroborated} dropped for lack of corroboration` : ''}${rr.skipped_cap ? `; ${rr.skipped_cap} pair(s) over the cap` : ''}${rr.errors ? `; ${rr.errors} call(s) failed (${rr.last_error})` : ''}`); } catch (e) {}\ntry { const emb = $('Attach Embedding').all().map(i => i.json); const un = emb.filter(a => !a.embedded); if (un.length) notes.push(`embeddings unavailable for ${un.length}/${emb.length} article(s) (${(un[0].embed_error || 'LM Studio down').slice(0, 80)}): clustering used lexical evidence only, no prior-story linking, Qdrant records stored without a semantic vector`); } catch (e) {}\n// IOC enrichment (VirusTotal + OTX) is optional: absent on IOC-free days or if the branch failed.\nlet iocIntel = {}, iocStats = null;\ntry { const a = $('Aggregate IOC Intel').first().json; iocIntel = a.iocs || {}; iocStats = a.stats || null; } catch (e) {}\nconst intel = v => iocIntel[v] || null;\nconst verdictOf = v => (intel(v) || {}).verdict || 'unverified';\nconst V_ORDER = { malicious: 0, suspicious: 1, unverified: 2, clean: 3 };\nconst sortIocs = arr => arr.slice().sort((a, b) => (V_ORDER[verdictOf(a.value)] - V_ORDER[verdictOf(b.value)]) || a.type.localeCompare(b.type));\nconst vtCell = r => !r ? '—' : r.vt.found ? `${r.vt.malicious}/${r.vt.total}${r.vt.threat_label ? ' ' + r.vt.threat_label : ''}` : (r.vt.error ? r.vt.error : 'none');\nconst otxCell = r => !r ? '—' : r.otx.found ? `${r.otx.pulse_count} pulse${r.otx.pulse_count === 1 ? '' : 's'}${r.otx.adversaries.length ? ' (' + r.otx.adversaries.join(', ') + ')' : (r.otx.malware_families.length ? ' (' + r.otx.malware_families.join(', ') + ')' : '')}${r.otx.whitelisted ? ' [whitelisted]' : ''}` : (r.otx.error ? r.otx.error : 'none');\nconst verdictTag = v => { const r = intel(v); return r ? `${r.verdict.toUpperCase()} · VT ${vtCell(r)} · OTX ${otxCell(r)}` : 'not looked up'; };\nconst verdictCounts = iocs => { const c = {}; for (const i of iocs) { const k = verdictOf(i.value); c[k] = (c[k] || 0) + 1; } return Object.keys(V_ORDER).filter(k => c[k]).map(k => `${c[k]} ${k}`).join(', '); };\nconst maliciousCount = s => s.brief.iocs.filter(i => verdictOf(i.value) === 'malicious').length;\nlet newCount = 0, windowCount = 0;\ntry { newCount = $('Attach Embedding').all().length; windowCount = $('Normalize').all().length; } catch (e) {}\nconst nowIso = new Date().toISOString();\nconst SEV = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };\nconst stories = clusters.slice().sort((a, b) => ((SEV[a.brief.severity] ?? 5) - (SEV[b.brief.severity] ?? 5)) || (b.articles.length - a.articles.length));\nstories.forEach((s, i) => { s.num = i + 1; });\n\n// defang the host's last dot (not the path's) and hxxp the scheme\nconst defang = v => {\n  v = String(v);\n  const m = v.match(/^(https?:\\/\\/)([^/?#:]+)(.*)$/i);  // no URL global in the runner sandbox\n  if (m) return 'hxxp' + m[1].slice(4) + m[2].replace(/\\.(?=[^.]*$)/, '[.]') + m[3];\n  return v.replace(/^http/i, 'hxxp').replace(/\\.(?=[^.]*$)/, '[.]');\n};\nconst esc = s => String(s == null ? '' : s).replace(/\\|/g, '\\\\|').replace(/\\r?\\n+/g, ' ').trim();\nconst slug = s => String(s).toLowerCase().replace(/[^\\w\\s-]/g, '').trim().replace(/\\s+/g, '-');\nconst pct = x => x == null ? '—' : (x * 100).toFixed(1) + '%';\nconst e = id => enriched[id] || {};\nconst cveTags = id => { const x = e(id); const p = [];\n  if (x.cvss != null) p.push(`CVSS ${x.cvss}${x.cvss_severity ? ' ' + x.cvss_severity : ''}`);\n  if (x.kev) p.push('**KEV**');\n  if (x.epss != null) p.push(`EPSS ${pct(x.epss)}`);\n  return p.join(' · ') || '—'; };\nconst hot = id => { const x = e(id); return !!x.kev || (x.cvss != null && x.cvss >= 9) || (x.epss != null && x.epss >= 0.5); };\n\nconst cveStories = {}, tidStories = {}, iocRows = [];\nfor (const s of stories) {\n  for (const v of s.brief.cves) (cveStories[v.id] = cveStories[v.id] || new Set()).add(s.num);\n  for (const t of s.brief.ttps) (tidStories[t.attack_id] = tidStories[t.attack_id] || { t, nums: new Set() }).nums.add(s.num);\n  for (const i of s.brief.iocs) iocRows.push({ ...i, num: s.num });\n}\nconst main = stories.filter(s => SEV[s.brief.severity] <= 2);\nconst minor = stories.filter(s => SEV[s.brief.severity] > 2);\n// Who actually synthesised (the configured chat_model is only the LM Studio failover)\nconst byProvider = {}; for (const s of stories) { const k = s.llm_provider ? `${s.llm_provider} (${s.llm_model})` : 'fallback (no LLM)'; byProvider[k] = (byProvider[k] || 0) + 1; }\nconst providerLabel = Object.entries(byProvider).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ×${v}`).join(', ') || 'no stories';\n\n// ------------------------------------------------------------------ markdown\nconst L = [];\nL.push(`# Cyber Intel Digest — ${cfg.run_date}`, '');\nL.push(`_Generated ${nowIso} · ${cfg.feeds.length} feeds · ${windowCount} articles in ${cfg.lookback_hours}h window · ${newCount} new · ${stories.length} consolidated stories · synthesis: ${providerLabel}_`, '');\nconst ACTIONABLE = new Set(['vulnerability', 'exploitation', 'breach', 'ransomware', 'malware', 'apt', 'phishing', 'supply-chain']);\nconst prio = stories.filter(s => s.brief.severity === 'critical'\n  || (s.brief.severity === 'high' && ACTIONABLE.has(s.brief.category) && (s.brief.cves.length || s.brief.iocs.length || s.brief.threat_actors.length || s.brief.malware.length || s.articles.length > 1))\n  || s.brief.cves.some(v => hot(v.id))\n  || maliciousCount(s) > 0);\nif (prio.length) {\n  L.push('## Priorities', '');\n  for (const s of prio) {\n    const bits = s.brief.cves.filter(v => hot(v.id)).map(v => `${v.id} (${cveTags(v.id).replace(/\\*\\*/g, '')})`);\n    const mc = maliciousCount(s); if (mc) bits.push(`${mc} IOC${mc > 1 ? 's' : ''} confirmed malicious (VT/OTX)`);\n    L.push(`- **[${s.brief.severity.toUpperCase()}]** ${esc(s.brief.headline)}${bits.length ? ' — ' + bits.join(', ') : ''} → [§${s.num}](#${s.num}-${slug(s.brief.headline)})`);\n  }\n  L.push('');\n}\nconst section = s => {\n  const b = s.brief;\n  L.push(`### ${s.num}. ${b.headline}`, '');\n  const meta = [`\\`${b.severity.toUpperCase()}\\``, b.category, `${s.articles.length} source${s.articles.length > 1 ? 's' : ''}`];\n  if (s.is_update && s.prior.length) meta.push(`↻ update to \"${esc(s.prior[0].title)}\" (${s.prior[0].digest_date})`);\n  L.push(meta.join(' · '), '');\n  L.push(b.summary, '');\n  if (b.whats_new) L.push(`**What's new:** ${b.whats_new}`, '');\n  if (b.key_facts.length) { L.push('**Key facts**', ''); b.key_facts.forEach(f => L.push(`- ${f}`)); L.push(''); }\n  if (b.affected_products.length) L.push(`**Affected:** ${b.affected_products.join(', ')}`, '');\n  if (b.cves.length) {\n    L.push('| CVE | Scoring | Exploited | Context |', '|---|---|---|---|');\n    for (const v of b.cves) { const x = e(v.id); L.push(`| [${v.id}](https://nvd.nist.gov/vuln/detail/${v.id}) | ${cveTags(v.id)} | ${(v.exploited_in_wild || x.kev) ? 'yes' : '—'} | ${esc(v.context || x.description || '').slice(0, 220)} |`); }\n    L.push('');\n  }\n  if (b.iocs.length) {\n    L.push(`**Indicators** (defanged · ${verdictCounts(b.iocs)})`, '', '```');\n    for (const i of sortIocs(b.iocs)) L.push(`${i.type.padEnd(8)} ${defang(i.value).padEnd(46)} ${verdictTag(i.value)}${i.context ? '  # ' + i.context : ''}`);\n    L.push('```', '');\n  }\n  if (b.ttps.length) { L.push('**ATT&CK**', ''); for (const t of b.ttps) L.push(`- [${t.attack_id} ${t.name}](${t.url})${t.behaviour ? ' — ' + t.behaviour : ''}${t.method === 'inferred' ? ' _(inferred)_' : ''}${t.deprecated ? ' _(deprecated technique)_' : ''}`); L.push(''); }\n  const ent = [];\n  if (b.threat_actors.length) ent.push(`**Actors:** ${b.threat_actors.join(', ')}`);\n  if (b.malware.length) ent.push(`**Malware:** ${b.malware.join(', ')}`);\n  if (ent.length) L.push(ent.join(' · '), '');\n  if (b.recommended_actions.length) { L.push('**Recommended actions**', ''); b.recommended_actions.forEach(a => L.push(`- ${a}`)); L.push(''); }\n  if (b.source_discrepancies.length) { L.push('**Source discrepancies**', ''); b.source_discrepancies.forEach(a => L.push(`- ${a}`)); L.push(''); }\n  const m = mispOf(s);\n  if (m) {\n    const older = m.cumulative.filter(c => !b.iocs.some(i => i.value === c.value));\n    L.push(`**MISP:** [event #${m.event_id}](${m.event_url}) · ${m.action}${m.added ? `, ${m.added} attribute${m.added === 1 ? '' : 's'} added` : ''}${m.duplicates ? `, ${m.duplicates} already on record` : ''} · ${m.cumulative.length} indicator${m.cumulative.length === 1 ? '' : 's'} on record${m.sources ? ` from ${m.sources} source${m.sources === 1 ? '' : 's'}` : ''}`, '');\n    if (older.length) {\n      L.push(`**Cumulative indicators from earlier coverage** (${older.length}, defanged · first seen · from MISP)`, '', '```');\n      for (const c of older.slice(0, 60)) L.push(`${c.type.padEnd(8)} ${defang(c.value).padEnd(46)} ${c.first_seen}  ${c.to_ids ? 'IDS' : '   '}  ${c.comment.slice(0, 60)}`);\n      if (older.length > 60) L.push(`… ${older.length - 60} more in MISP`);\n      L.push('```', '');\n    }\n  }\n  L.push('**Sources**', '');\n  for (const a of s.articles) L.push(`- [${esc(a.title)}](${a.url}) — ${a.source}, ${a.published.slice(0, 16).replace('T', ' ')}Z${a.text_source === 'rss' ? ' _(feed excerpt only)_' : ''}`);\n  if (s.is_update) for (const p of s.prior) L.push(`- ↻ previously: [${esc(p.title)}](${p.url}) — ${p.source}, digest ${p.digest_date}${p.misp_event_id ? ` · MISP event #${p.misp_event_id}` : ''}`);\n  L.push('', '---', '');\n};\nif (main.length) { L.push('## Stories', ''); main.forEach(section); }\nif (minor.length) {\n  L.push('## Also noted', '');\n  for (const s of minor) L.push(`- **${esc(s.brief.headline)}** (${s.brief.category}) — ${s.articles.map(a => `[${a.source}](${a.url})`).join(', ')}`);\n  L.push('');\n}\nconst allCves = Object.keys(cveStories).sort((a, b) => ((e(b).cvss ?? -1) - (e(a).cvss ?? -1)) || a.localeCompare(b));\nif (allCves.length) {\n  L.push('## Appendix A — CVEs', '', '| CVE | CVSS | KEV | EPSS | Vendor / product | Stories |', '|---|---|---|---|---|---|');\n  for (const id of allCves) { const x = e(id); L.push(`| [${id}](https://nvd.nist.gov/vuln/detail/${id}) | ${x.cvss ?? '—'}${x.cvss_severity ? ' ' + x.cvss_severity : ''} | ${x.kev ? 'yes' + (x.kev_due ? ' (due ' + x.kev_due + ')' : '') : '—'} | ${pct(x.epss)} | ${esc([x.vendor, x.product].filter(Boolean).join(' / '))} | ${[...cveStories[id]].map(n => '§' + n).join(', ')} |`); }\n  L.push('');\n}\nif (iocRows.length) {\n  L.push('## Appendix B — Indicators (defanged)', '', '| Verdict | Type | Indicator | VirusTotal | OTX | Story |', '|---|---|---|---|---|---|');\n  for (const i of sortIocs(iocRows)) { const r = intel(i.value); const vtl = r && r.vt.found ? `[${vtCell(r)}](${r.vt.gui})` : vtCell(r); const otl = r && r.otx.found ? `[${otxCell(r)}](${r.otx.url})` : otxCell(r);\n    L.push(`| ${verdictOf(i.value).toUpperCase()} | ${i.type} | \\`${defang(i.value)}\\` | ${esc(vtl)} | ${esc(otl)} | §${i.num} |`); }\n  L.push('');\n}\nconst tidList = Object.values(tidStories).sort((a, b) => a.t.attack_id.localeCompare(b.t.attack_id));\nif (tidList.length) {\n  L.push('## Appendix C — ATT&CK techniques', '', '| Technique | Tactic(s) | Stories |', '|---|---|---|');\n  for (const { t, nums } of tidList) L.push(`| [${t.attack_id} ${t.name}](${t.url}) | ${(t.tactics || []).join(', ')} | ${[...nums].map(n => '§' + n).join(', ')} |`);\n  L.push('');\n}\nconst llmFails = stories.filter(s => s.llm_error);\nconst rssOnly = stories.flatMap(s => s.articles).filter(a => a.text_source === 'rss').length;\nconst dropped = stories.flatMap(s => s.dropped_ttps || []);\nconst retried = stories.filter(s => (s.llm_attempts || []).length).length;\nL.push('## Run notes', '');\nL.push(`- LLM provider per story: ${Object.entries(byProvider).map(([k, v]) => `${k}: ${v}`).join(', ')}${retried ? ` · stories needing retries/fallback: ${retried}` : ''}`);\nfor (const n of [...new Set(stories.flatMap(s => s.llm_notes || []))]) L.push(`- ${n}`);\nL.push(`- Articles using feed excerpt only (site blocked or thin page): ${rssOnly}`);\nconst droppedU = [...new Set(dropped)];\nL.push(`- ATT&CK proposals rejected (not a technique, or id/name disagree): ${dropped.length}${droppedU.length ? ' (' + droppedU.slice(0, 10).join(', ') + (droppedU.length > 10 ? `, … ${droppedU.length - 10} more` : '') + ')' : ''}`);\nL.push(`- IOCs proposed by the model but rejected: ${stories.reduce((n, s) => n + (s.dropped_iocs || 0), 0)}`);\nif (iocStats) L.push(`- IOC enrichment: ${iocStats.looked_up} looked up → VirusTotal found ${iocStats.vt_found}, unknown ${iocStats.vt_not_found}${iocStats.vt_rate_limited ? ', rate-limited ' + iocStats.vt_rate_limited : ''}${iocStats.vt_errors ? ', errors ' + iocStats.vt_errors : ''}; OTX found ${iocStats.otx_found}${iocStats.otx_errors ? ', errors ' + iocStats.otx_errors : ''} → ${iocStats.malicious} malicious, ${iocStats.suspicious} suspicious, ${iocStats.clean} clean, ${iocStats.unverified} unverified`);\nelse { let noneEligible = false; try { noneEligible = !!$('Collect IOCs').first().json.none; } catch (e) {}\n  L.push(`- IOC enrichment: ${!iocRows.length ? 'no indicators to look up' : (noneEligible ? `no indicator of a type VirusTotal/OTX can look up (${iocRows.length} email/filename indicator${iocRows.length === 1 ? '' : 's'} kept as UNVERIFIED)` : 'unavailable this run (VT/OTX branch did not complete)')}`); }\nif (llmFails.length) L.push(`- Stories where LLM synthesis failed (raw excerpts shown): ${llmFails.map(s => '§' + s.num).join(', ')}`);\nfor (const n of notes) L.push(`- ${n}`);\nL.push('', `_Machine-readable: \\`${cfg.run_date}-stix.json\\` (STIX 2.1 bundle), \\`${cfg.run_date}-data.json\\` (full run data)._`, '');\nconst md = L.join('\\n');\n\n// ------------------------------------------------------------------ STIX 2.1\nconst S = [], seen = new Set();\nconst add = o => { if (!seen.has(o.id)) { seen.add(o.id); S.push(o); } return o.id; };\nconst IDENTITY = 'identity--' + uuidFrom('identity:cyberintel-digest');\nconst TLP = 'marking-definition--94868c89-83c2-464b-929b-a1a8aa3c8487';  // TLP:WHITE / CLEAR, fixed id per STIX 2.1 spec\nadd({ type: 'marking-definition', spec_version: '2.1', id: TLP, created: '2017-01-20T00:00:00.000Z', definition_type: 'tlp', name: 'TLP:WHITE', definition: { tlp: 'white' } });\nadd({ type: 'identity', spec_version: '2.1', id: IDENTITY, created: nowIso, modified: nowIso, name: 'CyberIntel Daily Digest', identity_class: 'system', description: 'Automated n8n pipeline consolidating public cyber security reporting' });\nconst base = (type, key) => ({ type, spec_version: '2.1', id: `${type}--${uuidFrom(type + ':' + key)}`, created: nowIso, modified: nowIso, created_by_ref: IDENTITY, object_marking_refs: [TLP] });\nconst q = v => String(v).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\");\nconst PAT = {\n  ipv4: v => `[ipv4-addr:value = '${q(v)}']`, ipv6: v => `[ipv6-addr:value = '${q(v)}']`,\n  domain: v => `[domain-name:value = '${q(v)}']`, url: v => `[url:value = '${q(v)}']`,\n  sha256: v => `[file:hashes.'SHA-256' = '${q(v)}']`, sha1: v => `[file:hashes.'SHA-1' = '${q(v)}']`, md5: v => `[file:hashes.MD5 = '${q(v)}']`,\n  email: v => `[email-addr:value = '${q(v)}']`, filename: v => `[file:name = '${q(v)}']`,\n};\nconst rel = (src, type, tgt) => add({ ...base('relationship', `${src}|${type}|${tgt}`), relationship_type: type, source_ref: src, target_ref: tgt });\nfor (const s of stories) {\n  const b = s.brief;\n  const vulnIds = b.cves.map(v => {\n    const x = e(v.id);\n    const o = { ...base('vulnerability', 'cve:' + v.id), name: v.id, description: v.context || x.description || '',\n      external_references: [{ source_name: 'cve', external_id: v.id, url: `https://nvd.nist.gov/vuln/detail/${v.id}` }] };\n    if (x.cvss != null) { o.x_cvss_base_score = x.cvss; o.x_cvss_severity = x.cvss_severity; o.x_cvss_vector = x.cvss_vector; }\n    if (x.kev) { o.x_cisa_kev = true; o.x_cisa_kev_date_added = x.kev_date_added; o.x_cisa_kev_due_date = x.kev_due; o.x_cisa_kev_known_ransomware = x.kev_ransomware; }\n    if (x.epss != null) { o.x_epss_score = x.epss; o.x_epss_percentile = x.epss_percentile; }\n    if (x.cwe) o.x_cwe = x.cwe;\n    if (v.exploited_in_wild) o.x_exploited_in_wild = true;\n    const labels = [...(x.kev ? ['kev'] : []), ...(v.exploited_in_wild ? ['exploited-in-wild'] : [])];\n    if (labels.length) o.labels = labels;\n    return add(o);\n  });\n  const indIds = b.iocs.filter(i => PAT[i.type]).map(i => {\n    const r = intel(i.value);\n    const o = { ...base('indicator', `ioc:${i.type}:${i.value}`),\n      name: `${i.type}: ${i.value}`, description: i.context || '', pattern: PAT[i.type](i.value), pattern_type: 'stix', pattern_version: '2.1',\n      valid_from: nowIso, indicator_types: [r && r.verdict === 'clean' ? 'benign' : 'malicious-activity'],\n      labels: [i.method === 'regex' ? 'source-extracted' : 'llm-extracted', r ? 'verdict-' + r.verdict : 'verdict-unverified'],\n      confidence: r ? r.confidence : 30 };\n    if (r) {\n      o.x_ioc_verdict = r.verdict;\n      const refs = [];\n      if (r.vt.found) { o.x_virustotal = { malicious: r.vt.malicious, suspicious: r.vt.suspicious, harmless: r.vt.harmless, undetected: r.vt.undetected, reputation: r.vt.reputation, last_analysis: r.vt.last_analysis, threat_label: r.vt.threat_label }; refs.push({ source_name: 'VirusTotal', url: r.vt.gui, description: `${r.vt.malicious}/${r.vt.total} engines malicious` }); }\n      if (r.otx.found) { o.x_otx = { pulse_count: r.otx.pulse_count, pulses: r.otx.pulses, tags: r.otx.tags, malware_families: r.otx.malware_families, adversaries: r.otx.adversaries, whitelisted: r.otx.whitelisted }; refs.push({ source_name: 'AlienVault OTX', url: r.otx.url, description: `${r.otx.pulse_count} pulses` }); }\n      if (refs.length) o.external_references = refs;\n    }\n    return add(o);\n  });\n  const apIds = b.ttps.map(t => add({ type: 'attack-pattern', spec_version: '2.1', id: t.stix_id, created: nowIso, modified: nowIso, name: t.name,\n    external_references: [{ source_name: 'mitre-attack', external_id: t.attack_id, url: t.url }],\n    kill_chain_phases: (t.tactics || []).map(p => ({ kill_chain_name: 'mitre-attack', phase_name: p })), x_mitre_is_subtechnique: t.attack_id.includes('.') }));\n  const actorIds = b.threat_actors.map(n => add({ ...base('intrusion-set', 'actor:' + n.toLowerCase()), name: n }));\n  const malIds = b.malware.map(n => add({ ...base('malware', 'malware:' + n.toLowerCase()), name: n, is_family: true, malware_types: ['unknown'] }));\n  for (const a of actorIds) { for (const ap of apIds) rel(a, 'uses', ap); for (const m of malIds) rel(a, 'uses', m); for (const v of vulnIds) rel(a, 'targets', v); }\n  for (const m of malIds) { for (const v of vulnIds) rel(m, 'exploits', v); for (const ap of apIds) rel(m, 'uses', ap); }\n  for (const i of indIds) { for (const m of malIds) rel(i, 'indicates', m); if (!malIds.length) for (const a of actorIds) rel(i, 'indicates', a); }\n  // Cumulative indicators from MISP (earlier days of the same story): same deterministic ids as when they were first\n  // emitted, so a TIP ingesting daily bundles sees one indicator object updated, not duplicates.\n  const mp = mispOf(s);\n  const MISP2IOC = { 'ip-dst': 'ipv4', 'ip-src': 'ipv4', domain: 'domain', hostname: 'domain', url: 'url', sha256: 'sha256', sha1: 'sha1', md5: 'md5', 'email-src': 'email', filename: 'filename' };\n  const cumIds = mp ? mp.cumulative.filter(c => MISP2IOC[c.type] && PAT[MISP2IOC[c.type]] && !b.iocs.some(i => i.value === c.value)).map(c => { const t = MISP2IOC[c.type]; const verdict = ((c.tags.find(x => x.startsWith('cyberintel:verdict=')) || '').match(/\"(\\w+)\"/) || [])[1] || 'unverified';\n    return add({ ...base('indicator', `ioc:${t}:${c.value}`), name: `${t}: ${c.value}`, description: c.comment, pattern: PAT[t](c.value), pattern_type: 'stix', pattern_version: '2.1', valid_from: c.first_seen + 'T00:00:00.000Z',\n      indicator_types: [verdict === 'clean' ? 'benign' : 'malicious-activity'], labels: ['cumulative-from-misp', 'verdict-' + verdict], x_ioc_verdict: verdict, x_first_seen_digest: c.first_seen, x_misp_event_id: mp.event_id, external_references: [{ source_name: 'MISP', url: mp.event_url }] }); }) : [];\n  const refs = [...vulnIds, ...indIds, ...cumIds, ...apIds, ...actorIds, ...malIds];\n  add({ ...base('report', 'report:' + s.cluster_id), name: b.headline, ...(mp ? { x_misp_event_id: mp.event_id, x_misp_event_uuid: mp.event_uuid, x_misp_event_url: mp.event_url, x_cyberintel_cumulative_indicators: mp.cumulative.length } : {}),\n    description: b.summary + (b.key_facts.length ? '\\n\\n' + b.key_facts.map(f => '- ' + f).join('\\n') : ''),\n    published: nowIso, report_types: ['threat-report'], labels: [b.category, b.severity],\n    object_refs: refs.length ? refs : [IDENTITY],\n    external_references: s.articles.map(a => ({ source_name: a.source, url: a.url, description: a.title })),\n    x_cyberintel_cluster_id: s.cluster_id, x_cyberintel_severity: b.severity, x_cyberintel_category: b.category,\n    x_cyberintel_affected_products: b.affected_products, x_cyberintel_recommended_actions: b.recommended_actions, x_cyberintel_is_update: !!s.is_update });\n}\nconst bundle = { type: 'bundle', id: 'bundle--' + uuidFrom('bundle:' + cfg.run_date + ':' + nowIso), objects: S };\n\n// ------------------------------------------------------------------ Discord (summary embed + digest attached, then the STIX bundle)\nconst DCOL = { critical: 0xE01E5A, high: 0xF2A100, medium: 0x2EB67D, low: 0x3B82F6, info: 0x6B7280 };\nconst topSev = stories.length ? stories[0].brief.severity : 'info';\nconst dPrio = prio.slice(0, 15).map(s => {\n  const bits = s.brief.cves.filter(v => hot(v.id)).map(v => `${v.id} (${cveTags(v.id).replace(/\\*\\*/g, '')})`);\n  const mc = maliciousCount(s); if (mc) bits.push(`${mc} malicious IOC${mc > 1 ? 's' : ''}`);\n  return `**[${s.brief.severity.toUpperCase()}]** §${s.num} ${s.brief.headline}${bits.length ? ' — ' + bits.join(', ') : ''}`;\n});\nlet dDesc = dPrio.length ? dPrio.join('\\n') : '_No priority items today — see the attached digest._';\nif (prio.length > 15) dDesc += `\\n_… ${prio.length - 15} more in the attached digest_`;\nif (dDesc.length > 4000) dDesc = dDesc.slice(0, 3990) + '…';\nconst kevCount = allCves.filter(id => e(id).kev).length;\nconst byTypeCounts = S.reduce((m, o) => (m[o.type] = (m[o.type] || 0) + 1, m), {});\nconst discordDigest = { username: 'CyberIntel Digest', allowed_mentions: { parse: [] }, embeds: [{\n  title: `Cyber Intel Digest — ${cfg.run_date}`, description: dDesc, color: DCOL[topSev] || DCOL.info, timestamp: nowIso,\n  fields: [\n    { name: 'Stories', value: String(stories.length), inline: true },\n    { name: 'CVEs', value: `${allCves.length}${kevCount ? ` (${kevCount} KEV)` : ''}`, inline: true },\n    { name: 'IOCs', value: `${iocRows.length}${iocStats ? ` (${iocStats.malicious} malicious)` : ''}`, inline: true },\n    { name: 'ATT&CK', value: String(tidList.length), inline: true },\n    { name: 'Articles', value: `${newCount} new / ${cfg.feeds.length} feeds`, inline: true },\n    { name: 'Synthesis', value: providerLabel.slice(0, 1000), inline: true },\n  ],\n  footer: { text: 'Full digest attached · STIX 2.1 bundle in the next message' },\n} ] };\nlet stixLine = `📎 STIX 2.1 bundle — ${cfg.run_date} — ${S.length} objects: ` + Object.entries(byTypeCounts).map(([k, v]) => `${v} ${k}`).join(', ');\nif (stixLine.length > 1900) stixLine = stixLine.slice(0, 1890) + '…';\nconst discordStix = { username: 'CyberIntel Digest', allowed_mentions: { parse: [] }, content: stixLine };\n\n// ------------------------------------------------------------------ data + files\nconst data = { run_date: cfg.run_date, generated: nowIso,\n  stats: { feeds: cfg.feeds.length, articles_in_window: windowCount, new_articles: newCount, stories: stories.length, cves: allCves.length, iocs: iocRows.length, iocs_malicious: iocStats ? iocStats.malicious : null, techniques: tidList.length, stix_objects: S.length },\n  config: { ...cfg, feeds: undefined }, stories: stories.map(s => ({ ...s, articles: s.articles.map(a => { const { text, ...r } = a; return r; }) })), enriched, ioc_intel: { stats: iocStats, iocs: iocIntel }, notes };\nreturn [\n  { json: { fileName: `${cfg.run_date}-digest.md`, content: md, discord_post: true, discord: discordDigest } },\n  { json: { fileName: `${cfg.run_date}-stix.json`, content: JSON.stringify(bundle, null, 2), discord_post: true, discord: discordStix } },\n  { json: { fileName: `${cfg.run_date}-data.json`, content: JSON.stringify(data, null, 2), discord_post: false } },\n  { json: { fileName: 'latest-digest.md', content: md, discord_post: false } },\n];"
+      },
+      "id": "7610dff9-736b-59b7-8ed5-7f298e438365",
+      "name": "Build Outputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "content",
+        "binaryPropertyName": "data",
+        "options": {
+          "fileName": "={{ $json.fileName }}",
+          "encoding": "utf8"
+        }
+      },
+      "id": "d7317173-8326-50fc-a6e4-dd5997387b74",
+      "name": "Convert to File",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $('Config').first().json.output_dir }}/{{ $binary.data.fileName }}",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "id": "5bc3a77e-e7c3-5917-b46d-9cbc4295a616",
+      "name": "Write Files",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        660,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Runs only after files are written, so a failed run is re-processed next day instead of silently marked seen.\nconst cfg = $('Config').first().json;\nconst clusterOf = {};\nfor (const c of $('Cluster').all()) for (const id of c.json.article_ids) clusterOf[id] = c.json.cluster_id;\n// MISP event per story (so tomorrow's prior-story link lands in the same event)\nlet mispStories = {}; try { mispStories = $('MISP Sync').first().json.misp.stories || {}; } catch (e) {}\nconst mispOf = cid => { const m = mispStories[cid]; return (m && m.event_id) ? { misp_event_id: String(m.event_id), misp_event_uuid: m.event_uuid || null } : {}; };\n// Articles that could not be embedded get a deterministic one-hot placeholder (Qdrant rejects zero vectors under cosine)\n// and payload embedded:false, so dedup-by-id works while prior-story search skips them (see Search Prior Body).\nconst DIM = Number(cfg.embed_dim) || 768;\nconst placeholder = id => { let h = 0; for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0; const v = new Array(DIM).fill(0); v[h % DIM] = 1; return v; };\nconst points = $('Attach Embedding').all().map(i => i.json).map(a => ({\n  id: a.id, vector: Array.isArray(a.vector) ? a.vector : placeholder(a.id),\n  payload: { url: a.url, title: a.title, source: a.source, published: a.published, published_ts: Math.floor(new Date(a.published).getTime() / 1000), digest_date: cfg.run_date, cluster_id: clusterOf[a.id] || null, cves: a.cves || [], embedded: Array.isArray(a.vector), ...mispOf(clusterOf[a.id]) },\n}));\nreturn [{ json: { points, count: points.length, unembedded: points.filter(p => !p.payload.embedded).length } }];"
+      },
+      "id": "ea4a5dc5-55b0-5b9d-a743-d327af00e34a",
+      "name": "Build Upsert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Config').first().json.qdrant_url }}/collections/{{ $('Config').first().json.collection }}/points?wait=true",
+        "options": {
+          "timeout": 120000
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ points: $json.points }) }}"
+      },
+      "id": "ae991131-81d7-563b-824f-b18726588176",
+      "name": "Qdrant: Upsert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        1200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "dp",
+              "leftValue": "={{ $('Build Outputs').item.json.discord_post }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "dw",
+              "leftValue": "={{ $('Config').first().json.discord_webhook }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "634f03a3-d038-5d5e-afdb-7eda594dbd3b",
+      "name": "Post to Discord?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        660,
+        1380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.discord_webhook }}?wait=true",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "payload_json",
+              "value": "={{ JSON.stringify($('Build Outputs').item.json.discord) }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "files[0]",
+              "inputDataFieldName": "data"
+            }
+          ]
+        }
+      },
+      "id": "c5ac36ed-4e11-5e07-afa7-e91f659de699",
+      "name": "Discord Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        1380
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "multipart: payload_json (embed/content) + files[0] (the binary from Convert to File)."
+    }
+  ],
+  "connections": {
+    "Daily 07:00": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "OpenRouter Models",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Models": {
+      "main": [
+        [
+          {
+            "node": "Rank Free Models",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank Free Models": {
+      "main": [
+        [
+          {
+            "node": "Groq Models",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Models": {
+      "main": [
+        [
+          {
+            "node": "Rank Groq Models",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank Groq Models": {
+      "main": [
+        [
+          {
+            "node": "Ensure Collection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure Collection": {
+      "main": [
+        [
+          {
+            "node": "Read ATTACK Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read ATTACK Map": {
+      "main": [
+        [
+          {
+            "node": "ATTACK Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ATTACK Map": {
+      "main": [
+        [
+          {
+            "node": "Split Feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Feeds": {
+      "main": [
+        [
+          {
+            "node": "RSS Read",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RSS Read": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Compute IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute IDs": {
+      "main": [
+        [
+          {
+            "node": "Qdrant: Retrieve Existing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant: Retrieve Existing": {
+      "main": [
+        [
+          {
+            "node": "Filter New",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter New": {
+      "main": [
+        [
+          {
+            "node": "Fetch Article",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Article": {
+      "main": [
+        [
+          {
+            "node": "Extract Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text": {
+      "main": [
+        [
+          {
+            "node": "Embed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed": {
+      "main": [
+        [
+          {
+            "node": "Attach Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Embedding": {
+      "main": [
+        [
+          {
+            "node": "Search Prior Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Prior Body": {
+      "main": [
+        [
+          {
+            "node": "Qdrant: Search Prior",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant: Search Prior": {
+      "main": [
+        [
+          {
+            "node": "Cluster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cluster": {
+      "main": [
+        [
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Synthesize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Synthesize": {
+      "main": [
+        [
+          {
+            "node": "Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate": {
+      "main": [
+        [
+          {
+            "node": "Collect IOCs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect IOCs": {
+      "main": [
+        [
+          {
+            "node": "Has IOCs?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has IOCs?": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge IOC Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal Lookup": {
+      "main": [
+        [
+          {
+            "node": "OTX Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OTX Lookup": {
+      "main": [
+        [
+          {
+            "node": "Aggregate IOC Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate IOC Intel": {
+      "main": [
+        [
+          {
+            "node": "Merge IOC Intel",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge IOC Intel": {
+      "main": [
+        [
+          {
+            "node": "Enrich CVEs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich CVEs": {
+      "main": [
+        [
+          {
+            "node": "MISP Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MISP Sync": {
+      "main": [
+        [
+          {
+            "node": "Build Outputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Outputs": {
+      "main": [
+        [
+          {
+            "node": "Convert to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to File": {
+      "main": [
+        [
+          {
+            "node": "Write Files",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Post to Discord?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Files": {
+      "main": [
+        [
+          {
+            "node": "Build Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Upsert": {
+      "main": [
+        [
+          {
+            "node": "Qdrant: Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to Discord?": {
+      "main": [
+        [
+          {
+            "node": "Discord Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "saveExecutionProgress": true,
+    "executionTimeout": 10800
+  }
+}
